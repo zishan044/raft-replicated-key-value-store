@@ -1,0 +1,6 @@
+version: v2
+plugins:
+  # Use the protobuf version pinned in go.mod for both generation and runtime.
+  - local: [go, run, google.golang.org/protobuf/cmd/protoc-gen-go]
+    out: pkg/api
+    opt: paths=source_relative

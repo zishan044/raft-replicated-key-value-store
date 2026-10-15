@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package raft.v1;
+
+option go_package = "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1;raftv1";
+
+// MessageType identifies the election messages supported by the peer protocol.
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+  MESSAGE_TYPE_PRE_VOTE = 1;
+  MESSAGE_TYPE_PRE_VOTE_RESPONSE = 2;
+  MESSAGE_TYPE_REQUEST_VOTE = 3;
+  MESSAGE_TYPE_REQUEST_VOTE_RESPONSE = 4;
+}
+
+// Message carries an election request or response between Raft nodes.
+message Message {
+  MessageType type = 1;
+  // Node IDs are positive; zero is not a valid sender or recipient.
+  uint64 from = 2;
+  uint64 to = 3;
+  // For a PreVote request, term is the proposed election term.
+  uint64 term = 4;
+  // Requests carry the candidate's last log position (both zero for an empty log).
+  uint64 last_log_index = 5;
+  uint64 last_log_term = 6;
+  // Responses set reject when the vote is denied; requests leave it false.
+  bool reject = 7;
+}
