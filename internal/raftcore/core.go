@@ -1,6 +1,6 @@
 // Package raftcore implements the single-threaded Raft state machine. Callers
 // supply logical ticks and messages; the core performs no I/O and reads no clock.
-// Leader heartbeats are added in subset 3; this subset implements elections.
+// It currently implements elections and leader heartbeats, without replication.
 package raftcore
 
 import (
@@ -84,12 +84,13 @@ type Core struct {
 	lastLogTerm    uint64
 	votes          map[uint64]bool
 
-	electionElapsed int
-	electionTimeout int
-	messages        []*raftv1.Message
-	savedState      HardState
-	initialized     bool
-	readyPending    bool
+	electionElapsed  int
+	electionTimeout  int
+	heartbeatElapsed int
+	messages         []*raftv1.Message
+	savedState       HardState
+	initialized      bool
+	readyPending     bool
 }
 
 func New(cfg Config) (*Core, error) {
@@ -130,13 +131,18 @@ func New(cfg Config) (*Core, error) {
 	}, nil
 }
 
-// Tick advances logical election time, campaigning when a non-leader times out.
+// Tick campaigns when a non-leader times out, or emits periodic leader heartbeats.
 // Consume the initial Ready before supplying the first input.
 func (c *Core) Tick() error {
 	if !c.initialized || c.readyPending {
 		return ErrReadyPending
 	}
 	if c.role == Leader {
+		c.heartbeatElapsed++
+		if c.heartbeatElapsed >= c.heartbeatTicks {
+			c.heartbeatElapsed = 0
+			c.broadcastHeartbeat()
+		}
 		return nil
 	}
 	if c.electionElapsed == c.electionTimeout-1 && c.hardState.Term == ^uint64(0) {
@@ -167,7 +173,7 @@ func (c *Core) Tick() error {
 	return nil
 }
 
-// Step handles RequestVote and its response without retaining the input.
+// Step handles RequestVote, its response, and heartbeats without retaining input.
 // Unsupported or malformed messages never change term, vote, or election time.
 func (c *Core) Step(msg *raftv1.Message) error {
 	if !c.initialized || c.readyPending {
@@ -176,22 +182,31 @@ func (c *Core) Step(msg *raftv1.Message) error {
 	if msg == nil || msg.To != c.id || msg.From == c.id || !slices.Contains(c.voters, msg.From) {
 		return errors.New("message must be addressed to this node from another voter")
 	}
-	if msg.Type != raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE && msg.Type != raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE {
+	switch msg.Type {
+	case raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE:
+		if msg.Reject || (msg.LastLogIndex == 0) != (msg.LastLogTerm == 0) || msg.LastLogTerm > msg.Term {
+			return errors.New("invalid RequestVote log metadata or reject flag")
+		}
+	case raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE:
+	case raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT:
+		if msg.Reject || msg.LastLogIndex != 0 || msg.LastLogTerm != 0 {
+			return errors.New("heartbeats must not carry vote results or log metadata")
+		}
+	default:
 		return fmt.Errorf("%w: %s", ErrUnsupportedMessage, msg.Type)
 	}
 	if msg.Term == 0 {
 		return errors.New("election messages require a positive term")
 	}
-	if msg.Type == raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE &&
-		(msg.Reject || (msg.LastLogIndex == 0) != (msg.LastLogTerm == 0) || msg.LastLogTerm > msg.Term) {
-		return errors.New("invalid RequestVote log metadata or reject flag")
+	if msg.Type == raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT {
+		if msg.Term >= c.hardState.Term {
+			c.becomeFollower(msg.Term, msg.From)
+		}
+		// Stale heartbeats are ignored. Heartbeat responses await CheckQuorum.
+		return nil
 	}
 	if msg.Term > c.hardState.Term {
-		c.role = Follower
-		c.leaderID = 0
-		c.hardState = HardState{Term: msg.Term}
-		c.votes = nil
-		c.resetElectionTimer()
+		c.becomeFollower(msg.Term, 0)
 	}
 	if msg.Type == raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE {
 		upToDate := msg.LastLogTerm > c.lastLogTerm ||
@@ -223,6 +238,17 @@ func (c *Core) resetElectionTimer() {
 	c.electionTimeout = c.electionTicks + c.rng.IntN(c.electionTicks)
 }
 
+func (c *Core) becomeFollower(term, leaderID uint64) {
+	if term > c.hardState.Term {
+		c.hardState = HardState{Term: term}
+	}
+	c.role = Follower
+	c.leaderID = leaderID
+	c.votes = nil
+	c.heartbeatElapsed = 0
+	c.resetElectionTimer()
+}
+
 func (c *Core) maybeBecomeLeader() {
 	granted := 0
 	for _, voter := range c.voters {
@@ -234,7 +260,22 @@ func (c *Core) maybeBecomeLeader() {
 		c.role = Leader
 		c.leaderID = c.id
 		c.electionElapsed = 0
+		c.heartbeatElapsed = 0
 		c.votes = nil
+		c.broadcastHeartbeat()
+	}
+}
+
+func (c *Core) broadcastHeartbeat() {
+	for _, peer := range c.voters {
+		if peer != c.id {
+			c.messages = append(c.messages, &raftv1.Message{
+				Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT,
+				From: c.id,
+				To:   peer,
+				Term: c.hardState.Term,
+			})
+		}
 	}
 }
 

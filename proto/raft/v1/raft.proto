@@ -11,9 +11,11 @@ enum MessageType {
   MESSAGE_TYPE_PRE_VOTE_RESPONSE = 2;
   MESSAGE_TYPE_REQUEST_VOTE = 3;
   MESSAGE_TYPE_REQUEST_VOTE_RESPONSE = 4;
+  // Leader contact only; log replication is introduced separately.
+  MESSAGE_TYPE_HEARTBEAT = 5;
 }
 
-// Message carries an election request or response between Raft nodes.
+// Message carries an election request, response, or heartbeat between Raft nodes.
 message Message {
   MessageType type = 1;
   // Node IDs are positive; zero is not a valid sender or recipient.
@@ -21,7 +23,8 @@ message Message {
   uint64 to = 3;
   // For a PreVote request, term is the proposed election term.
   uint64 term = 4;
-  // Requests carry the candidate's last log position (both zero for an empty log).
+  // Vote requests carry the candidate's last log position (both zero for an empty
+  // log). Heartbeats leave both fields zero.
   uint64 last_log_index = 5;
   uint64 last_log_term = 6;
   // Responses set reject when the vote is denied; requests leave it false.

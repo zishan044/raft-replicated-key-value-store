@@ -30,6 +30,8 @@ const (
 	MessageType_MESSAGE_TYPE_PRE_VOTE_RESPONSE     MessageType = 2
 	MessageType_MESSAGE_TYPE_REQUEST_VOTE          MessageType = 3
 	MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE MessageType = 4
+	// Leader contact only; log replication is introduced separately.
+	MessageType_MESSAGE_TYPE_HEARTBEAT MessageType = 5
 )
 
 // Enum value maps for MessageType.
@@ -40,6 +42,7 @@ var (
 		2: "MESSAGE_TYPE_PRE_VOTE_RESPONSE",
 		3: "MESSAGE_TYPE_REQUEST_VOTE",
 		4: "MESSAGE_TYPE_REQUEST_VOTE_RESPONSE",
+		5: "MESSAGE_TYPE_HEARTBEAT",
 	}
 	MessageType_value = map[string]int32{
 		"MESSAGE_TYPE_UNSPECIFIED":           0,
@@ -47,6 +50,7 @@ var (
 		"MESSAGE_TYPE_PRE_VOTE_RESPONSE":     2,
 		"MESSAGE_TYPE_REQUEST_VOTE":          3,
 		"MESSAGE_TYPE_REQUEST_VOTE_RESPONSE": 4,
+		"MESSAGE_TYPE_HEARTBEAT":             5,
 	}
 )
 
@@ -77,7 +81,7 @@ func (MessageType) EnumDescriptor() ([]byte, []int) {
 	return file_raft_v1_raft_proto_rawDescGZIP(), []int{0}
 }
 
-// Message carries an election request or response between Raft nodes.
+// Message carries an election request, response, or heartbeat between Raft nodes.
 type Message struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Type  MessageType            `protobuf:"varint,1,opt,name=type,proto3,enum=raft.v1.MessageType" json:"type,omitempty"`
@@ -86,7 +90,8 @@ type Message struct {
 	To   uint64 `protobuf:"varint,3,opt,name=to,proto3" json:"to,omitempty"`
 	// For a PreVote request, term is the proposed election term.
 	Term uint64 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
-	// Requests carry the candidate's last log position (both zero for an empty log).
+	// Vote requests carry the candidate's last log position (both zero for an empty
+	// log). Heartbeats leave both fields zero.
 	LastLogIndex uint64 `protobuf:"varint,5,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
 	LastLogTerm  uint64 `protobuf:"varint,6,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
 	// Responses set reject when the vote is denied; requests leave it false.
@@ -186,13 +191,14 @@ const file_raft_v1_raft_proto_rawDesc = "" +
 	"\x04term\x18\x04 \x01(\x04R\x04term\x12$\n" +
 	"\x0elast_log_index\x18\x05 \x01(\x04R\flastLogIndex\x12\"\n" +
 	"\rlast_log_term\x18\x06 \x01(\x04R\vlastLogTerm\x12\x16\n" +
-	"\x06reject\x18\a \x01(\bR\x06reject*\xb1\x01\n" +
+	"\x06reject\x18\a \x01(\bR\x06reject*\xcd\x01\n" +
 	"\vMessageType\x12\x1c\n" +
 	"\x18MESSAGE_TYPE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15MESSAGE_TYPE_PRE_VOTE\x10\x01\x12\"\n" +
 	"\x1eMESSAGE_TYPE_PRE_VOTE_RESPONSE\x10\x02\x12\x1d\n" +
 	"\x19MESSAGE_TYPE_REQUEST_VOTE\x10\x03\x12&\n" +
-	"\"MESSAGE_TYPE_REQUEST_VOTE_RESPONSE\x10\x04BQZOgithub.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1;raftv1b\x06proto3"
+	"\"MESSAGE_TYPE_REQUEST_VOTE_RESPONSE\x10\x04\x12\x1a\n" +
+	"\x16MESSAGE_TYPE_HEARTBEAT\x10\x05BQZOgithub.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1;raftv1b\x06proto3"
 
 var (
 	file_raft_v1_raft_proto_rawDescOnce sync.Once
