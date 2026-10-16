@@ -4,12 +4,16 @@ A Go project working toward a replicated, linearizable key-value store with Raft
 consensus implemented from scratch, gRPC, durable storage, and deterministic
 fault testing.
 
-## Current milestone: M0 skeleton
+## Current milestone: M1 elections and simulator v0
 
-The node starts an HTTP server with JSON logs. The repository also contains
-versioned peer protobufs, generated Go types, and provisional `Clock`, `Ticker`,
-and `Transport` interfaces. Raft, KV operations, persistence, working peer
-transport, metrics, and a cluster are not implemented yet.
+The pure Raft core implements RequestVote, seeded election timeouts, leader
+heartbeats, and a `Ready`/`Advance` output contract. A deterministic simulator
+drives in-memory nodes and injects network faults while checking election safety.
+
+The `kvd` binary still serves the M0 HTTP skeleton with JSON logs. KV operations,
+log replication, durable storage, real peer networking, and metrics are not
+implemented yet. The provisional `Clock`, `Ticker`, and `Transport` interfaces
+remain available for later node integration.
 
 ## Setup
 
@@ -63,17 +67,61 @@ curl -i http://127.0.0.1:8080/healthz
 curl -i http://127.0.0.1:8080/readyz
 ```
 
-| Endpoint | M0 response | Meaning |
+| Endpoint | Current response | Meaning |
 | --- | --- | --- |
 | `GET /healthz` | `200`, `ok` | The process is serving HTTP. |
 | `GET /readyz` | `503`, `not ready` | The node cannot serve KV requests yet. |
 
 Other methods on these endpoints return `405` with `Allow: GET`. Readiness stays
-unavailable throughout M0; it will eventually require a known leader and a
+unavailable throughout M1; it will eventually require a known leader and a
 caught-up state machine.
 
 Press Ctrl-C or send SIGTERM to shut down. The server stops accepting connections
 and gives active requests up to five seconds to finish.
+
+## Election simulator
+
+```bash
+make sim                    # 10,000 seeds, starting at zero
+make sim SEEDS=500           # smaller uncached campaign
+make sim SEED=123            # one seed with its full event trace
+```
+
+`SEEDS` must be positive. `SEED` selects one unsigned 64-bit seed, including zero,
+and takes precedence over `SEEDS`. To save a replay, redirect its output:
+`make sim SEED=123 > /tmp/raft-seed-123.log`. A failure prints the seed, the replay
+command, and the full trace. Reproduction requires the same code and pinned Go
+toolchain. These commands use Go tests with the race detector and disable the
+test-result cache; no additional binary or dependency is required.
+
+Even seeds use three nodes and odd seeds use five. Each successive pair rotates
+through healthy delivery, loss, delay, duplication, reordering, symmetric
+partitions, asymmetric partitions, leader isolation, combined changing faults,
+and a blackout that forces split votes. Delay schedules also include a fixed
+20-tick delay to exercise elections before vote traffic can arrive. Leader
+isolation first establishes a leader, then checks that the connected majority
+elects its replacement.
+
+Every schedule has a 200-tick fault phase. Healing restores reliable one-tick
+delivery and drains old queued messages on the next tick without discarding
+them. After that drain, all nodes must agree on one leader within 200 ticks;
+the suite checks agreement at that deadline and requires the same leader and
+term on every tick for another 40 ticks. Election deadlines are 10–19 ticks and
+heartbeats occur every two ticks. Simulation uses logical time without sleeps.
+
+After every core input, the simulator checks that no two nodes have ever become
+leader in the same term, remembering old leaders after they step down. An
+isolated old leader can retain its role in an older term until higher-term
+contact arrives; CheckQuorum and PreVote are deferred to M6. Traces record the
+seed, configuration, faults, message scheduling/delivery, saved election state,
+and leadership transitions. Identical seeded schedules produce identical traces.
+
+Term and vote are saved in memory before dependent messages are queued. There is
+no crash durability, crash/restart simulation, or disk fault model yet (M3).
+These tests establish election safety and bounded recovery for the tested
+schedules, not log safety, KV linearizability, or a universal randomized-election
+deadline. M1 acceptance requires a passing 10,000-seed campaign and repository
+checks; real-process cluster demonstrations come later.
 
 ## Review and development commands
 
@@ -81,7 +129,10 @@ and gives active requests up to five seconds to finish.
 | --- | --- |
 | `make build` | Build `bin/kvd`. |
 | `make run` | Start the node with default flags. |
-| `make test` | Run `go test -race ./...`. |
+| `make test` | Run `go test -race ./...`, including 500 simulation seeds. |
+| `make sim` | Run 10,000 simulation seeds without cached results. |
+| `make sim SEEDS=500` | Run the first 500 simulation seeds without cached results. |
+| `make sim SEED=123` | Replay one seed with its full event trace. |
 | `make fmt` | Format Go and protobuf source. |
 | `make fmt-check` | Check formatting without rewriting files. |
 | `make proto-lint` | Run Buf's standard protobuf lint rules. |
@@ -97,8 +148,7 @@ hand. Generation runs the Go generator from the protobuf module pinned in
 `make proto-check` detects changed, missing, or extra generated files without
 rewriting the working tree.
 
-GitHub Actions runs the same `make tools` and `make check` commands on pushes to
-`main`, pull requests, and manual workflow dispatches. Simulation checks will be
-added with the simulator. M0 acceptance requires passing local checks, a node
-serving `/healthz`, and a successful GitHub CI run; local checks alone do not
-verify remote CI.
+GitHub Actions runs `make tools` and `make check` on pushes to `main`, pull
+requests, manual workflow dispatches, and its nightly schedule. These checks
+include 500 simulation seeds. Nightly runs also execute `make sim SEEDS=20000`
+without cached results. Local checks alone do not verify hosted CI execution.

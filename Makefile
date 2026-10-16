@@ -2,8 +2,9 @@
 
 BUF_VERSION := 1.74.0
 GOLANGCI_LINT_VERSION := 2.14.0
+SEEDS ?= 10000
 
-.PHONY: build run test tools fmt fmt-check lint proto proto-lint proto-check check
+.PHONY: build run test sim tools fmt fmt-check lint proto proto-lint proto-check check
 
 build:
 	go build -o bin/kvd ./cmd/kvd
@@ -13,6 +14,10 @@ run:
 
 test:
 	go test -race ./...
+
+sim:
+	go test -race -count=1 -timeout=20m ./test/sim -run '^TestSeededElections$$' $(if $(filter undefined,$(origin SEED)),,-v) \
+		-args -seeds "$(SEEDS)" $(if $(filter undefined,$(origin SEED)),,-seed "$(SEED)" -trace)
 
 tools:
 	@set -eu; \

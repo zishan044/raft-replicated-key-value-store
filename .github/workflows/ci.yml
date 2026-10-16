@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '0 20 * * *' # 02:00 Asia/Dhaka
 
 permissions:
   contents: read
@@ -12,7 +14,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       GOTOOLCHAIN: local
     steps:
@@ -22,5 +24,8 @@ jobs:
           go-version-file: go.mod
       - name: Install pinned tools
         run: make tools
-      - name: Check M0
+      - name: Check M1 (includes 500 simulation seeds)
         run: make check
+      - name: Nightly simulation campaign
+        if: github.event_name == 'schedule'
+        run: make sim SEEDS=20000
