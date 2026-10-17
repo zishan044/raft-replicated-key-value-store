@@ -1,6 +1,8 @@
 package sim_test
 
 import (
+	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand/v2"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/zishan044/raft-replicated-key-value-store.git/internal/raftcore"
 	"github.com/zishan044/raft-replicated-key-value-store.git/internal/sim"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -22,7 +25,7 @@ var profiles = []string{
 	"symmetric-partition", "asymmetric-partition", "leader-isolation", "combined", "split-votes",
 }
 
-func TestSeededElections(t *testing.T) {
+func TestSeededReplication(t *testing.T) {
 	replay := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "seed" {
@@ -104,6 +107,9 @@ func runSchedule(t *testing.T, seed uint64) *sim.Simulator {
 			fail(t, s, seed, "healthy warm-up did not establish a leader")
 		}
 		isolated, oldTerm = leader.ID, leader.HardState.Term
+		_, _, err := s.Propose(leader.ID, []byte(fmt.Sprintf("seed=%d warmup", seed)))
+		check(t, s, seed, err)
+		check(t, s, seed, s.Run(10))
 		for _, peer := range voters {
 			if peer != isolated {
 				check(t, s, seed, s.SetBlocked(isolated, peer, true))
@@ -128,6 +134,22 @@ func runSchedule(t *testing.T, seed uint64) *sim.Simulator {
 			}
 		}
 		check(t, s, seed, s.Tick())
+		if tick%10 == 0 {
+			// Every self-declared leader gets unique commands, including a
+			// minority's old leader while a replacement accepts majority writes.
+			for _, status := range s.Statuses() {
+				if status.Role == raftcore.Leader {
+					data := []byte(fmt.Sprintf("seed=%d tick=%d leader=%d", seed, s.Now(), status.ID))
+					_, _, err := s.Propose(status.ID, data)
+					check(t, s, seed, err)
+				}
+			}
+			id := voters[rng.IntN(size)]
+			_, _, err := s.Propose(id, []byte(fmt.Sprintf("seed=%d tick=%d probe=%d", seed, s.Now(), id)))
+			if err != nil && !errors.Is(err, raftcore.ErrNotLeader) {
+				check(t, s, seed, err)
+			}
+		}
 		if (profile == "split-votes" || delayedVotes) && tick == 18 {
 			// Every initial deadline is 10..19, and a second cannot expire
 			// before tick 20. At tick 19 everyone has self-voted in term 1.
@@ -155,18 +177,49 @@ func runSchedule(t *testing.T, seed uint64) *sim.Simulator {
 			fail(t, s, seed, "connected majority failed to replace the isolated leader")
 		}
 	}
-	recoverLeadership(t, s, seed)
+	recoverReplication(t, s, seed)
 	return s
 }
 
-func recoverLeadership(t *testing.T, s *sim.Simulator, seed uint64) {
+func recoverReplication(t *testing.T, s *sim.Simulator, seed uint64) {
 	t.Helper()
 	s.Heal()
 	check(t, s, seed, s.Tick()) // drain old traffic before measuring recovery
-	check(t, s, seed, s.Run(200))
+	var markerIndex, markerTerm, markerLeader uint64
+	var marker []byte
+	for tick := 0; tick < 200; tick++ {
+		check(t, s, seed, s.Tick())
+		leader, ok := knownLeader(s.Statuses())
+		if ok && (leader.ID != markerLeader || leader.HardState.Term != markerTerm) {
+			marker = []byte(fmt.Sprintf("seed=%d recovery_tick=%d leader=%d", seed, tick, leader.ID))
+			var err error
+			markerIndex, markerTerm, err = s.Propose(leader.ID, marker)
+			check(t, s, seed, err)
+			markerLeader = leader.ID
+		}
+	}
 	leader, ok := knownLeader(s.Statuses())
 	if !ok {
 		fail(t, s, seed, "no agreed leader at the 200-tick recovery deadline")
+	}
+	if markerIndex == 0 || markerLeader != leader.ID || markerTerm != leader.HardState.Term {
+		fail(t, s, seed, "no fresh proposal from the recovered leader within 200 ticks")
+	}
+	canonical, _ := s.AppliedEntries(leader.ID)
+	if uint64(len(canonical)) < markerIndex {
+		fail(t, s, seed, "recovered leader did not apply its fresh proposal within 200 ticks")
+	}
+	for _, status := range s.Statuses() {
+		applied, _ := s.AppliedEntries(status.ID)
+		if uint64(len(applied)) < markerIndex || applied[markerIndex-1].Term != markerTerm ||
+			!bytes.Equal(applied[markerIndex-1].Data, marker) {
+			fail(t, s, seed, "a node did not apply the fresh recovery proposal within 200 ticks")
+		}
+		for i := uint64(0); i < markerIndex; i++ {
+			if !proto.Equal(applied[i], canonical[i]) {
+				fail(t, s, seed, "nodes did not converge through the fresh committed proposal")
+			}
+		}
 	}
 	for range 40 {
 		check(t, s, seed, s.Tick())

@@ -16,7 +16,7 @@ test:
 	go test -race ./...
 
 sim:
-	go test -race -count=1 -timeout=20m ./test/sim -run '^TestSeededElections$$' $(if $(filter undefined,$(origin SEED)),,-v) \
+	go test -race -count=1 -timeout=20m ./test/sim -run '^TestSeededReplication$$' $(if $(filter undefined,$(origin SEED)),,-v) \
 		-args -seeds "$(SEEDS)" $(if $(filter undefined,$(origin SEED)),,-seed "$(SEED)" -trace)
 
 tools:

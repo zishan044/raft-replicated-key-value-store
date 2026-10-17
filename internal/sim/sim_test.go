@@ -1,6 +1,7 @@
 package sim
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -482,5 +483,65 @@ func TestElectionSafetyRemembersPastLeaders(t *testing.T) {
 	trace, now := s.Trace(), s.Now()
 	if s.Tick() != err || s.Run(1) != err || s.Now() != now || s.Trace() != trace {
 		t.Fatal("simulation continued after its invariant failed")
+	}
+}
+
+func TestProposalApplicationOwnershipAndReplay(t *testing.T) {
+	schedule := func() *Simulator {
+		s := newSim(t, 42)
+		before := s.Trace()
+		if _, _, err := s.Propose(99, nil); err == nil || s.Trace() != before {
+			t.Fatal("unknown proposal target accepted or changed the trace")
+		}
+		if _, ok := s.AppliedEntries(99); ok {
+			t.Fatal("unknown node returned application history")
+		}
+		run(t, s, 80)
+		var leader, follower uint64
+		for _, status := range s.Statuses() {
+			if status.Role == raftcore.Leader {
+				leader = status.ID
+			} else {
+				follower = status.ID
+			}
+		}
+		if leader == 0 || follower == 0 {
+			t.Fatal("test failed to establish a leader and follower")
+		}
+		if _, _, err := s.Propose(follower, []byte("rejected")); !errors.Is(err, raftcore.ErrNotLeader) {
+			t.Fatalf("follower proposal returned %v", err)
+		}
+		data := []byte("replicated command")
+		index, term, err := s.Propose(leader, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data[0] = 'x'
+		if uint64(len(s.appliedEntries[leader])) >= index {
+			t.Fatal("proposal acceptance was confused with application")
+		}
+		run(t, s, 20)
+		for _, id := range s.voters {
+			entries, ok := s.AppliedEntries(id)
+			if !ok || uint64(len(entries)) != index || entries[index-1].Term != term || string(entries[index-1].Data) != "replicated command" {
+				t.Fatalf("node %d did not apply the accepted command", id)
+			}
+			entries[index-1].Data[0] = 'y'
+			entries[index-1].Term = 99
+			entries[0] = nil
+			fresh, _ := s.AppliedEntries(id)
+			if fresh[0] == nil || fresh[index-1].Term != term || string(fresh[index-1].Data) != "replicated command" {
+				t.Fatal("application inspection changed the simulator's history")
+			}
+		}
+		for _, event := range []string{"propose node=", "proposal_rejected", "proposal_accepted", "save_entry", "prev_index=", "commit node=", "apply node="} {
+			if !strings.Contains(s.Trace(), event) {
+				t.Fatalf("trace omitted %q", event)
+			}
+		}
+		return s
+	}
+	if first, replay := schedule(), schedule(); first.Trace() != replay.Trace() {
+		t.Fatal("identical seeded proposal schedules did not replay byte for byte")
 	}
 }

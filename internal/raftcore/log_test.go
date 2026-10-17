@@ -104,6 +104,20 @@ func TestInitialLogReadyOwnershipAndApply(t *testing.T) {
 	}
 }
 
+func TestLogInspectionOwnership(t *testing.T) {
+	cfg := config()
+	cfg.HardState.Term = 2
+	cfg.Entries = logWithTerms(1, 2)
+	core := newElectionCore(t, cfg)
+	entries := core.Log()
+	entries[0].Data[0] = 'x'
+	entries[1].Term = 99
+	entries[1] = nil
+	if !equalEntries(core.Log(), cfg.Entries) || core.Status().LastLogTerm != 2 {
+		t.Fatal("log inspection changed core entries or nested data")
+	}
+}
+
 func TestChangedSuffixAndNewCommittedPrefix(t *testing.T) {
 	cfg := config()
 	cfg.HardState = HardState{Term: 3, Commit: 1}

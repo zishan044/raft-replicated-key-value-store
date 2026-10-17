@@ -24,7 +24,7 @@ jobs:
           go-version-file: go.mod
       - name: Install pinned tools
         run: make tools
-      - name: Check M1 (includes 500 simulation seeds)
+      - name: Check M2 (includes 500 replication simulation seeds)
         run: make check
       - name: Nightly simulation campaign
         if: github.event_name == 'schedule'

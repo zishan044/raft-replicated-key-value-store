@@ -52,6 +52,11 @@ type Simulator struct {
 	storedEntries  map[uint64][]*raftv1.Entry
 	appliedEntries map[uint64][]*raftv1.Entry
 	leaders        map[uint64]uint64 // term -> first leader ever observed in that term
+	leaderTerms    []uint64          // observation order, for deterministic history checks
+	leaderLogs     map[uint64][]*raftv1.Entry
+	observed       map[uint64]nodeView
+	committed      []commitRecord  // first observed commitment at each index, never discarded
+	applied        []*raftv1.Entry // canonical application history, across all nodes
 	rng            *rand.Rand
 	faults         Faults
 	blocked        map[link]bool
@@ -83,6 +88,7 @@ func New(cfg Config) (*Simulator, error) {
 		nodes: make(map[uint64]*raftcore.Core), stored: make(map[uint64]raftcore.HardState),
 		storedEntries: make(map[uint64][]*raftv1.Entry), appliedEntries: make(map[uint64][]*raftv1.Entry),
 		leaders: make(map[uint64]uint64), blocked: make(map[link]bool),
+		leaderLogs: make(map[uint64][]*raftv1.Entry), observed: make(map[uint64]nodeView),
 		rng: rand.New(rand.NewPCG(cfg.Seed, 0)), faults: Faults{MinDelay: 1, MaxDelay: 1},
 	}
 	s.log("config %+v", cfg)
@@ -221,6 +227,34 @@ func (s *Simulator) Run(ticks int) error {
 	return nil
 }
 
+// Propose delivers an opaque command to one node and processes its Ready batch.
+// ErrNotLeader is a normal rejection. Acceptance returns a local log position;
+// inspect AppliedEntries to establish application. Other core failures are terminal.
+func (s *Simulator) Propose(id uint64, data []byte) (index, term uint64, err error) {
+	if s.err != nil {
+		return 0, 0, s.err
+	}
+	core := s.nodes[id]
+	if core == nil {
+		return 0, 0, errors.New("proposal must target a voter")
+	}
+	before := core.Status()
+	s.log("propose node=%d data=%x", id, data)
+	index, term, err = core.Propose(data)
+	if err != nil {
+		s.log("proposal_rejected node=%d reason=%v", id, err)
+		if errors.Is(err, raftcore.ErrNotLeader) {
+			return 0, 0, err
+		}
+		return 0, 0, s.fail(err)
+	}
+	s.log("proposal_accepted node=%d index=%d term=%d", id, index, term)
+	if err := s.finish(core, before); err != nil {
+		return 0, 0, s.fail(err)
+	}
+	return index, term, nil
+}
+
 func (s *Simulator) Now() int { return s.now }
 
 // Statuses returns independent value snapshots in ascending voter ID order.
@@ -237,19 +271,38 @@ func (s *Simulator) SavedState(id uint64) (raftcore.HardState, bool) {
 	return state, ok
 }
 
+// AppliedEntries returns independent copies, including no-op positions.
+func (s *Simulator) AppliedEntries(id uint64) ([]*raftv1.Entry, bool) {
+	if s.nodes[id] == nil {
+		return nil, false
+	}
+	var entries []*raftv1.Entry
+	for _, entry := range s.appliedEntries[id] {
+		entries = append(entries, proto.Clone(entry).(*raftv1.Entry))
+	}
+	return entries, true
+}
+
 // Trace includes the seed, configuration, controls, deliveries and transitions.
 // Repeating the same control calls at the same ticks reproduces it byte for byte.
 func (s *Simulator) Trace() string { return strings.Join(s.trace, "\n") + "\n" }
 
 func (s *Simulator) finish(core *raftcore.Core, before raftcore.Status) error {
 	status := core.Status()
-	if before.Role != status.Role || before.HardState != status.HardState || before.LeaderID != status.LeaderID {
+	if before.Role != status.Role || before.HardState != status.HardState || before.LeaderID != status.LeaderID ||
+		before.LastLogIndex != status.LastLogIndex || before.LastLogTerm != status.LastLogTerm {
 		s.log("state %+v", status)
 	}
-	if err := s.checkLeader(status); err != nil {
+	rd := core.Ready()
+	previous, seen := s.observed[status.ID]
+	changed := !seen || len(rd.Entries) > 0 || status.LastLogIndex != uint64(len(previous.entries)) || status.LastLogTerm != previous.status.LastLogTerm
+	entries := previous.entries
+	if changed {
+		entries = core.Log()
+	}
+	if err := s.checkLogs(nodeView{status: status, entries: entries}, changed); err != nil {
 		return err
 	}
-	rd := core.Ready()
 	if len(rd.Entries) > 0 {
 		first := rd.Entries[0].Index
 		stored := s.storedEntries[status.ID]
@@ -259,10 +312,16 @@ func (s *Simulator) finish(core *raftcore.Core, before raftcore.Status) error {
 		// Ready transfers ownership of these entry copies to the consumer.
 		s.storedEntries[status.ID] = append(stored[:first-1], rd.Entries...)
 		s.log("save_entries node=%d first=%d count=%d", status.ID, first, len(rd.Entries))
+		for _, entry := range rd.Entries {
+			s.log("save_entry node=%d index=%d term=%d type=%s data=%x", status.ID, entry.Index, entry.Term, entry.Type, entry.Data)
+		}
 	}
 	if rd.HardState != nil {
 		s.stored[status.ID] = *rd.HardState
 		s.log("save node=%d term=%d vote=%d commit=%d", status.ID, rd.HardState.Term, rd.HardState.Vote, rd.HardState.Commit)
+	}
+	if status.HardState.Commit != before.HardState.Commit {
+		s.log("commit node=%d index=%d", status.ID, status.HardState.Commit)
 	}
 	for _, msg := range rd.Messages {
 		s.enqueue(msg)
@@ -273,11 +332,19 @@ func (s *Simulator) finish(core *raftcore.Core, before raftcore.Status) error {
 			entry.Index > uint64(len(stored)) || !proto.Equal(entry, stored[entry.Index-1]) {
 			return fmt.Errorf("node %d: application at index %d is out of order or not retained and committed", status.ID, entry.Index)
 		}
+		if err := s.checkApplied(status.ID, entry); err != nil {
+			return err
+		}
 		s.appliedEntries[status.ID] = append(s.appliedEntries[status.ID], entry)
-		s.log("apply node=%d index=%d term=%d type=%s", status.ID, entry.Index, entry.Term, entry.Type)
+		s.log("apply node=%d index=%d term=%d type=%s data=%x", status.ID, entry.Index, entry.Term, entry.Type, entry.Data)
 	}
 	if rd.HardState != nil || len(rd.Entries) > 0 || len(rd.Messages) > 0 || len(rd.CommittedEntries) > 0 {
-		return core.Advance()
+		if err := core.Advance(); err != nil {
+			return err
+		}
+		view := s.observed[status.ID]
+		view.status = core.Status()
+		s.observed[status.ID] = view
 	}
 	return nil
 }
@@ -291,6 +358,7 @@ func (s *Simulator) checkLeader(status raftcore.Status) error {
 			}
 		} else {
 			s.leaders[term] = status.ID
+			s.leaderTerms = append(s.leaderTerms, term)
 			s.log("leader node=%d term=%d", status.ID, term)
 		}
 	}
@@ -330,6 +398,7 @@ func (s *Simulator) fail(err error) error {
 }
 
 func describe(msg *raftv1.Message) string {
-	return fmt.Sprintf("%s from=%d to=%d term=%d reject=%t last_index=%d last_term=%d",
-		msg.Type, msg.From, msg.To, msg.Term, msg.Reject, msg.LastLogIndex, msg.LastLogTerm)
+	return fmt.Sprintf("%s from=%d to=%d term=%d reject=%t last_index=%d last_term=%d prev_index=%d prev_term=%d entries=%d commit=%d match=%d conflict_term=%d conflict_index=%d",
+		msg.Type, msg.From, msg.To, msg.Term, msg.Reject, msg.LastLogIndex, msg.LastLogTerm,
+		msg.PrevLogIndex, msg.PrevLogTerm, len(msg.Entries), msg.LeaderCommit, msg.MatchIndex, msg.ConflictTerm, msg.ConflictIndex)
 }

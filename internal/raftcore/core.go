@@ -516,6 +516,9 @@ func (c *Core) Status() Status {
 	}
 }
 
+// Log returns a caller-owned snapshot of the complete, uncompacted log.
+func (c *Core) Log() []*raftv1.Entry { return cloneEntries(c.log) }
+
 func (c *Core) lastLogIndex() uint64 { return uint64(len(c.log)) }
 
 func (c *Core) lastLogTerm() uint64 {

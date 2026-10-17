@@ -4,16 +4,18 @@ A Go project working toward a replicated, linearizable key-value store with Raft
 consensus implemented from scratch, gRPC, durable storage, and deterministic
 fault testing.
 
-## Current milestone: M1 elections and simulator v0
+## Current milestone: M2 log replication
 
-The pure Raft core implements RequestVote, seeded election timeouts, leader
-heartbeats, and a `Ready`/`Advance` output contract. A deterministic simulator
-drives in-memory nodes and injects network faults while checking election safety.
+The pure Raft core implements elections, an owned in-memory log, AppendEntries,
+conflict hints, leader proposals, an election no-op, current-term majority
+commitment, and ordered application through `Ready`/`Advance`. Idle leaders send
+empty AppendEntries. A deterministic simulator submits commands under network
+faults and checks all five Raft safety invariants.
 
 The `kvd` binary still serves the M0 HTTP skeleton with JSON logs. KV operations,
-log replication, durable storage, real peer networking, and metrics are not
-implemented yet. The provisional `Clock`, `Ticker`, and `Transport` interfaces
-remain available for later node integration.
+durable storage, real peer networking, and metrics are not implemented yet. The
+provisional `Clock`, `Ticker`, and `Transport` interfaces remain available for
+later node integration.
 
 ## Setup
 
@@ -73,13 +75,13 @@ curl -i http://127.0.0.1:8080/readyz
 | `GET /readyz` | `503`, `not ready` | The node cannot serve KV requests yet. |
 
 Other methods on these endpoints return `405` with `Allow: GET`. Readiness stays
-unavailable throughout M1; it will eventually require a known leader and a
+unavailable throughout M2; it will eventually require a known leader and a
 caught-up state machine.
 
 Press Ctrl-C or send SIGTERM to shut down. The server stops accepting connections
 and gives active requests up to five seconds to finish.
 
-## Election simulator
+## Replication simulator
 
 ```bash
 make sim                    # 10,000 seeds, starting at zero
@@ -98,30 +100,67 @@ Even seeds use three nodes and odd seeds use five. Each successive pair rotates
 through healthy delivery, loss, delay, duplication, reordering, symmetric
 partitions, asymmetric partitions, leader isolation, combined changing faults,
 and a blackout that forces split votes. Delay schedules also include a fixed
-20-tick delay to exercise elections before vote traffic can arrive. Leader
-isolation first establishes a leader, then checks that the connected majority
-elects its replacement.
+20-tick delay to exercise elections before vote traffic arrives. Leader isolation
+first establishes a leader and replicates a baseline command, then checks that
+the connected majority elects its replacement.
 
-Every schedule has a 200-tick fault phase. Healing restores reliable one-tick
-delivery and drains old queued messages on the next tick without discarding
-them. After that drain, all nodes must agree on one leader within 200 ticks;
-the suite checks agreement at that deadline and requires the same leader and
-term on every tick for another 40 ticks. Election deadlines are 10–19 ticks and
-heartbeats occur every two ticks. Simulation uses logical time without sleeps.
+Every schedule has a 200-tick fault phase. Every ten ticks, each node that calls
+itself leader receives a unique command; a seeded random target also receives a
+proposal to exercise follower rejection. This includes both an isolated old
+leader and its replacement. Local acceptance returns an index and term; it does
+not promise commitment or application. A minority's accepted commands may be
+replaced after healing.
 
-After every core input, the simulator checks that no two nodes have ever become
-leader in the same term, remembering old leaders after they step down. An
-isolated old leader can retain its role in an older term until higher-term
-contact arrives; CheckQuorum and PreVote are deferred to M6. Traces record the
-seed, configuration, faults, message scheduling/delivery, saved election state,
-and leadership transitions. Identical seeded schedules produce identical traces.
+Healing restores reliable one-tick delivery and drains old queued messages on
+the next tick without discarding them. During the next 200 ticks, the suite
+submits a fresh marker whenever all nodes agree on a recovered leader. At the
+deadline, every node must agree on the leader and have applied that leader's
+marker with an identical preceding entry sequence. The same leader and term
+must remain on every node for another 40 ticks. Election deadlines are 10–19
+ticks and heartbeat appends occur every two ticks. Simulation uses logical time
+without sleeps.
 
-Term and vote are saved in memory before dependent messages are queued. There is
-no crash durability, crash/restart simulation, or disk fault model yet (M3).
-These tests establish election safety and bounded recovery for the tested
-schedules, not log safety, KV linearizability, or a universal randomized-election
-deadline. M1 acceptance requires a passing 10,000-seed campaign and repository
-checks; real-process cluster demonstrations come later.
+The simulator checks these invariants after core inputs, reusing immutable log
+snapshots while logs are unchanged:
+
+- **Election Safety:** one leader per term, including leaders already deposed.
+- **Leader Append-Only:** a leader retains its earlier entries throughout its term.
+- **Log Matching:** equal index and term imply identical entries and prefixes.
+- **Leader Completeness:** later leaders contain previously committed entries,
+  including when an older commitment is observed after a later leader steps down.
+- **State Machine Safety:** every application at an index agrees with the
+  historical application at that index, across nodes and leadership changes.
+
+Historical leader logs, committed entries, and applied entries are retained for
+the whole run. Focused tests plant invalid observations to prove the checkers
+reject them. Traces include proposal payloads and outcomes, append positions,
+conflict hints, retained entries, commit advances, application, faults and
+leadership changes. Identical seeded schedules produce identical event traces.
+An isolated leader can retain its role in an older term until higher-term
+contact arrives; CheckQuorum and PreVote remain deferred to M6.
+
+The core copies proposal data and constructor entries. `Log()` and `Ready()`
+return independent snapshots. Consumers retain a `Ready` batch's entries and
+hard state before sending its messages, apply its committed entries in order,
+then call `Advance`. No-op entries advance the applied position without
+executing a command. Retrying `Ready` returns the same batch; consumers must
+track completed application when resuming a partially processed batch. Initial
+entries are emitted for retention, and their committed prefix is replayed for
+application. All retention is currently in memory.
+
+M2 acceptance requires repository checks and a passing uncached 10,000-seed
+campaign. Unit tests cover all six Figure 7 log shapes and both Figure 8
+commitment branches from the [Raft paper](https://raft.github.io/raft.pdf), with
+real votes and follower responses. Figure 8 holds back the generated no-op by
+delivering a valid prefix of a captured append batch to isolate the commit rule
+from full-suffix batching; automatic election no-ops remain enabled.
+
+These tests establish log safety and bounded recovery for the tested schedules.
+They do not establish KV linearizability or a universal randomized-election
+recovery deadline. Crash durability, restart simulation, and disk faults belong
+to M3; the KV API and client sessions belong to M4. Bounded batches, pipelining,
+and proposal backpressure are deferred. Real-process cluster demonstrations
+come later.
 
 ## Review and development commands
 
@@ -150,5 +189,5 @@ rewriting the working tree.
 
 GitHub Actions runs `make tools` and `make check` on pushes to `main`, pull
 requests, manual workflow dispatches, and its nightly schedule. These checks
-include 500 simulation seeds. Nightly runs also execute `make sim SEEDS=20000`
+include 500 replication simulation seeds. Nightly runs also execute `make sim SEEDS=20000`
 without cached results. Local checks alone do not verify hosted CI execution.
