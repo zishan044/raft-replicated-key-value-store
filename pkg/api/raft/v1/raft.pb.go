@@ -21,7 +21,8 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// MessageType identifies the election messages supported by the peer protocol.
+// MessageType identifies messages in the peer protocol. Append handling is
+// introduced after the log and output contracts.
 type MessageType int32
 
 const (
@@ -31,7 +32,9 @@ const (
 	MessageType_MESSAGE_TYPE_REQUEST_VOTE          MessageType = 3
 	MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE MessageType = 4
 	// Leader contact only; log replication is introduced separately.
-	MessageType_MESSAGE_TYPE_HEARTBEAT MessageType = 5
+	MessageType_MESSAGE_TYPE_HEARTBEAT               MessageType = 5
+	MessageType_MESSAGE_TYPE_APPEND_ENTRIES          MessageType = 6
+	MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE MessageType = 7
 )
 
 // Enum value maps for MessageType.
@@ -43,14 +46,18 @@ var (
 		3: "MESSAGE_TYPE_REQUEST_VOTE",
 		4: "MESSAGE_TYPE_REQUEST_VOTE_RESPONSE",
 		5: "MESSAGE_TYPE_HEARTBEAT",
+		6: "MESSAGE_TYPE_APPEND_ENTRIES",
+		7: "MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE",
 	}
 	MessageType_value = map[string]int32{
-		"MESSAGE_TYPE_UNSPECIFIED":           0,
-		"MESSAGE_TYPE_PRE_VOTE":              1,
-		"MESSAGE_TYPE_PRE_VOTE_RESPONSE":     2,
-		"MESSAGE_TYPE_REQUEST_VOTE":          3,
-		"MESSAGE_TYPE_REQUEST_VOTE_RESPONSE": 4,
-		"MESSAGE_TYPE_HEARTBEAT":             5,
+		"MESSAGE_TYPE_UNSPECIFIED":             0,
+		"MESSAGE_TYPE_PRE_VOTE":                1,
+		"MESSAGE_TYPE_PRE_VOTE_RESPONSE":       2,
+		"MESSAGE_TYPE_REQUEST_VOTE":            3,
+		"MESSAGE_TYPE_REQUEST_VOTE_RESPONSE":   4,
+		"MESSAGE_TYPE_HEARTBEAT":               5,
+		"MESSAGE_TYPE_APPEND_ENTRIES":          6,
+		"MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE": 7,
 	}
 )
 
@@ -81,7 +88,126 @@ func (MessageType) EnumDescriptor() ([]byte, []int) {
 	return file_raft_v1_raft_proto_rawDescGZIP(), []int{0}
 }
 
-// Message carries an election request, response, or heartbeat between Raft nodes.
+type EntryType int32
+
+const (
+	EntryType_ENTRY_TYPE_UNSPECIFIED EntryType = 0
+	EntryType_ENTRY_TYPE_NORMAL      EntryType = 1
+	EntryType_ENTRY_TYPE_NO_OP       EntryType = 2
+)
+
+// Enum value maps for EntryType.
+var (
+	EntryType_name = map[int32]string{
+		0: "ENTRY_TYPE_UNSPECIFIED",
+		1: "ENTRY_TYPE_NORMAL",
+		2: "ENTRY_TYPE_NO_OP",
+	}
+	EntryType_value = map[string]int32{
+		"ENTRY_TYPE_UNSPECIFIED": 0,
+		"ENTRY_TYPE_NORMAL":      1,
+		"ENTRY_TYPE_NO_OP":       2,
+	}
+)
+
+func (x EntryType) Enum() *EntryType {
+	p := new(EntryType)
+	*p = x
+	return p
+}
+
+func (x EntryType) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (EntryType) Descriptor() protoreflect.EnumDescriptor {
+	return file_raft_v1_raft_proto_enumTypes[1].Descriptor()
+}
+
+func (EntryType) Type() protoreflect.EnumType {
+	return &file_raft_v1_raft_proto_enumTypes[1]
+}
+
+func (x EntryType) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use EntryType.Descriptor instead.
+func (EntryType) EnumDescriptor() ([]byte, []int) {
+	return file_raft_v1_raft_proto_rawDescGZIP(), []int{1}
+}
+
+// Entry is an immutable command or election no-op at a positive log position.
+type Entry struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Term  uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	Index uint64                 `protobuf:"varint,2,opt,name=index,proto3" json:"index,omitempty"`
+	Type  EntryType              `protobuf:"varint,3,opt,name=type,proto3,enum=raft.v1.EntryType" json:"type,omitempty"`
+	// No-op entries have no data; normal entry data is opaque to Raft.
+	Data          []byte `protobuf:"bytes,4,opt,name=data,proto3" json:"data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Entry) Reset() {
+	*x = Entry{}
+	mi := &file_raft_v1_raft_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Entry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Entry) ProtoMessage() {}
+
+func (x *Entry) ProtoReflect() protoreflect.Message {
+	mi := &file_raft_v1_raft_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Entry.ProtoReflect.Descriptor instead.
+func (*Entry) Descriptor() ([]byte, []int) {
+	return file_raft_v1_raft_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *Entry) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *Entry) GetIndex() uint64 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
+}
+
+func (x *Entry) GetType() EntryType {
+	if x != nil {
+		return x.Type
+	}
+	return EntryType_ENTRY_TYPE_UNSPECIFIED
+}
+
+func (x *Entry) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+// Message carries an election or replication message between Raft nodes.
 type Message struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Type  MessageType            `protobuf:"varint,1,opt,name=type,proto3,enum=raft.v1.MessageType" json:"type,omitempty"`
@@ -94,15 +220,28 @@ type Message struct {
 	// log). Heartbeats leave both fields zero.
 	LastLogIndex uint64 `protobuf:"varint,5,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
 	LastLogTerm  uint64 `protobuf:"varint,6,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
-	// Responses set reject when the vote is denied; requests leave it false.
-	Reject        bool `protobuf:"varint,7,opt,name=reject,proto3" json:"reject,omitempty"`
+	// Responses set reject when a vote or append is denied.
+	Reject bool `protobuf:"varint,7,opt,name=reject,proto3" json:"reject,omitempty"`
+	// Appends name the preceding entry (both zero at the start of the log).
+	// Append responses echo prev_log_index to identify the request being answered.
+	PrevLogIndex uint64   `protobuf:"varint,8,opt,name=prev_log_index,json=prevLogIndex,proto3" json:"prev_log_index,omitempty"`
+	PrevLogTerm  uint64   `protobuf:"varint,9,opt,name=prev_log_term,json=prevLogTerm,proto3" json:"prev_log_term,omitempty"`
+	Entries      []*Entry `protobuf:"bytes,10,rep,name=entries,proto3" json:"entries,omitempty"`
+	LeaderCommit uint64   `protobuf:"varint,11,opt,name=leader_commit,json=leaderCommit,proto3" json:"leader_commit,omitempty"`
+	// Successful append responses acknowledge the last index matched by the
+	// request, which can be smaller than the follower's local last index.
+	MatchIndex uint64 `protobuf:"varint,12,opt,name=match_index,json=matchIndex,proto3" json:"match_index,omitempty"`
+	// Rejections report the conflicting term and its first index. A missing
+	// preceding entry uses term zero and the follower's last index plus one.
+	ConflictTerm  uint64 `protobuf:"varint,13,opt,name=conflict_term,json=conflictTerm,proto3" json:"conflict_term,omitempty"`
+	ConflictIndex uint64 `protobuf:"varint,14,opt,name=conflict_index,json=conflictIndex,proto3" json:"conflict_index,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Message) Reset() {
 	*x = Message{}
-	mi := &file_raft_v1_raft_proto_msgTypes[0]
+	mi := &file_raft_v1_raft_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -114,7 +253,7 @@ func (x *Message) String() string {
 func (*Message) ProtoMessage() {}
 
 func (x *Message) ProtoReflect() protoreflect.Message {
-	mi := &file_raft_v1_raft_proto_msgTypes[0]
+	mi := &file_raft_v1_raft_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -127,7 +266,7 @@ func (x *Message) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Message.ProtoReflect.Descriptor instead.
 func (*Message) Descriptor() ([]byte, []int) {
-	return file_raft_v1_raft_proto_rawDescGZIP(), []int{0}
+	return file_raft_v1_raft_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *Message) GetType() MessageType {
@@ -179,11 +318,65 @@ func (x *Message) GetReject() bool {
 	return false
 }
 
+func (x *Message) GetPrevLogIndex() uint64 {
+	if x != nil {
+		return x.PrevLogIndex
+	}
+	return 0
+}
+
+func (x *Message) GetPrevLogTerm() uint64 {
+	if x != nil {
+		return x.PrevLogTerm
+	}
+	return 0
+}
+
+func (x *Message) GetEntries() []*Entry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
+func (x *Message) GetLeaderCommit() uint64 {
+	if x != nil {
+		return x.LeaderCommit
+	}
+	return 0
+}
+
+func (x *Message) GetMatchIndex() uint64 {
+	if x != nil {
+		return x.MatchIndex
+	}
+	return 0
+}
+
+func (x *Message) GetConflictTerm() uint64 {
+	if x != nil {
+		return x.ConflictTerm
+	}
+	return 0
+}
+
+func (x *Message) GetConflictIndex() uint64 {
+	if x != nil {
+		return x.ConflictIndex
+	}
+	return 0
+}
+
 var File_raft_v1_raft_proto protoreflect.FileDescriptor
 
 const file_raft_v1_raft_proto_rawDesc = "" +
 	"\n" +
-	"\x12raft/v1/raft.proto\x12\araft.v1\"\xcd\x01\n" +
+	"\x12raft/v1/raft.proto\x12\araft.v1\"m\n" +
+	"\x05Entry\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x14\n" +
+	"\x05index\x18\x02 \x01(\x04R\x05index\x12&\n" +
+	"\x04type\x18\x03 \x01(\x0e2\x12.raft.v1.EntryTypeR\x04type\x12\x12\n" +
+	"\x04data\x18\x04 \x01(\fR\x04data\"\xd3\x03\n" +
 	"\aMessage\x12(\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x14.raft.v1.MessageTypeR\x04type\x12\x12\n" +
 	"\x04from\x18\x02 \x01(\x04R\x04from\x12\x0e\n" +
@@ -191,14 +384,29 @@ const file_raft_v1_raft_proto_rawDesc = "" +
 	"\x04term\x18\x04 \x01(\x04R\x04term\x12$\n" +
 	"\x0elast_log_index\x18\x05 \x01(\x04R\flastLogIndex\x12\"\n" +
 	"\rlast_log_term\x18\x06 \x01(\x04R\vlastLogTerm\x12\x16\n" +
-	"\x06reject\x18\a \x01(\bR\x06reject*\xcd\x01\n" +
+	"\x06reject\x18\a \x01(\bR\x06reject\x12$\n" +
+	"\x0eprev_log_index\x18\b \x01(\x04R\fprevLogIndex\x12\"\n" +
+	"\rprev_log_term\x18\t \x01(\x04R\vprevLogTerm\x12(\n" +
+	"\aentries\x18\n" +
+	" \x03(\v2\x0e.raft.v1.EntryR\aentries\x12#\n" +
+	"\rleader_commit\x18\v \x01(\x04R\fleaderCommit\x12\x1f\n" +
+	"\vmatch_index\x18\f \x01(\x04R\n" +
+	"matchIndex\x12#\n" +
+	"\rconflict_term\x18\r \x01(\x04R\fconflictTerm\x12%\n" +
+	"\x0econflict_index\x18\x0e \x01(\x04R\rconflictIndex*\x98\x02\n" +
 	"\vMessageType\x12\x1c\n" +
 	"\x18MESSAGE_TYPE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15MESSAGE_TYPE_PRE_VOTE\x10\x01\x12\"\n" +
 	"\x1eMESSAGE_TYPE_PRE_VOTE_RESPONSE\x10\x02\x12\x1d\n" +
 	"\x19MESSAGE_TYPE_REQUEST_VOTE\x10\x03\x12&\n" +
 	"\"MESSAGE_TYPE_REQUEST_VOTE_RESPONSE\x10\x04\x12\x1a\n" +
-	"\x16MESSAGE_TYPE_HEARTBEAT\x10\x05BQZOgithub.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1;raftv1b\x06proto3"
+	"\x16MESSAGE_TYPE_HEARTBEAT\x10\x05\x12\x1f\n" +
+	"\x1bMESSAGE_TYPE_APPEND_ENTRIES\x10\x06\x12(\n" +
+	"$MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE\x10\a*T\n" +
+	"\tEntryType\x12\x1a\n" +
+	"\x16ENTRY_TYPE_UNSPECIFIED\x10\x00\x12\x15\n" +
+	"\x11ENTRY_TYPE_NORMAL\x10\x01\x12\x14\n" +
+	"\x10ENTRY_TYPE_NO_OP\x10\x02BQZOgithub.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1;raftv1b\x06proto3"
 
 var (
 	file_raft_v1_raft_proto_rawDescOnce sync.Once
@@ -212,19 +420,23 @@ func file_raft_v1_raft_proto_rawDescGZIP() []byte {
 	return file_raft_v1_raft_proto_rawDescData
 }
 
-var file_raft_v1_raft_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_raft_v1_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_raft_v1_raft_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_raft_v1_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_raft_v1_raft_proto_goTypes = []any{
 	(MessageType)(0), // 0: raft.v1.MessageType
-	(*Message)(nil),  // 1: raft.v1.Message
+	(EntryType)(0),   // 1: raft.v1.EntryType
+	(*Entry)(nil),    // 2: raft.v1.Entry
+	(*Message)(nil),  // 3: raft.v1.Message
 }
 var file_raft_v1_raft_proto_depIdxs = []int32{
-	0, // 0: raft.v1.Message.type:type_name -> raft.v1.MessageType
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	1, // 0: raft.v1.Entry.type:type_name -> raft.v1.EntryType
+	0, // 1: raft.v1.Message.type:type_name -> raft.v1.MessageType
+	2, // 2: raft.v1.Message.entries:type_name -> raft.v1.Entry
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_raft_v1_raft_proto_init() }
@@ -237,8 +449,8 @@ func file_raft_v1_raft_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_raft_v1_raft_proto_rawDesc), len(file_raft_v1_raft_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   1,
+			NumEnums:      2,
+			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

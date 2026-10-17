@@ -12,6 +12,14 @@ func config() Config {
 	return Config{ID: 1, Voters: []uint64{3, 1, 2}, ElectionTicks: 10, HeartbeatTicks: 2, Seed: 42}
 }
 
+func entriesWithTerm(count int, term uint64) []*raftv1.Entry {
+	entries := make([]*raftv1.Entry, count)
+	for i := range entries {
+		entries[i] = &raftv1.Entry{Index: uint64(i) + 1, Term: term, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL}
+	}
+	return entries
+}
+
 func TestConfigValidation(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -31,9 +39,6 @@ func TestConfigValidation(t *testing.T) {
 		{"overflow interval", func(c *Config) { c.ElectionTicks = int(^uint(0) >> 1) }},
 		{"vote without term", func(c *Config) { c.HardState.Vote = 1 }},
 		{"vote outside membership", func(c *Config) { c.HardState = HardState{Term: 2, Vote: 9} }},
-		{"log index without term", func(c *Config) { c.LastLogIndex = 1 }},
-		{"log term without index", func(c *Config) { c.LastLogTerm = 1; c.HardState.Term = 1 }},
-		{"future log term", func(c *Config) { c.LastLogIndex = 1; c.LastLogTerm = 2; c.HardState.Term = 1 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := config()
@@ -48,7 +53,7 @@ func TestConfigValidation(t *testing.T) {
 func TestInitialStateAndDeterminism(t *testing.T) {
 	cfg := config()
 	cfg.HardState = HardState{Term: 4, Vote: 2}
-	cfg.LastLogIndex, cfg.LastLogTerm = 9, 3
+	cfg.Entries = entriesWithTerm(9, 3)
 	core, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -164,6 +169,8 @@ func TestStepBoundary(t *testing.T) {
 	for _, msgType := range []raftv1.MessageType{
 		raftv1.MessageType_MESSAGE_TYPE_PRE_VOTE,
 		raftv1.MessageType_MESSAGE_TYPE_PRE_VOTE_RESPONSE,
+		raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES,
+		raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE,
 		raftv1.MessageType_MESSAGE_TYPE_UNSPECIFIED,
 		999,
 	} {

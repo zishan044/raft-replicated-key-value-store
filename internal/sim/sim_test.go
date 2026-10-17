@@ -8,6 +8,7 @@ import (
 
 	"github.com/zishan044/raft-replicated-key-value-store.git/internal/raftcore"
 	raftv1 "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 func newSim(t *testing.T, seed uint64) *Simulator {
@@ -160,6 +161,66 @@ func TestReliableClockOrderingAndMemory(t *testing.T) {
 	first, second := strings.Index(trace, "deliver id=1 "), strings.Index(trace, "deliver id=2 ")
 	if first < 0 || second <= first || s.stored[2].Term != 2 {
 		t.Fatal("equal-time delivery did not preserve insertion order")
+	}
+}
+
+func TestInitialLogBatchRetainedAndApplied(t *testing.T) {
+	s := newSim(t, 42)
+	entries := []*raftv1.Entry{
+		{Index: 1, Term: 1, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL, Data: []byte("first")},
+		{Index: 2, Term: 3, Type: raftv1.EntryType_ENTRY_TYPE_NO_OP},
+		{Index: 3, Term: 3, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL, Data: []byte("pending")},
+	}
+	core, err := raftcore.New(raftcore.Config{
+		ID: 1, Voters: s.voters, Seed: 42, ElectionTicks: 10, HeartbeatTicks: 2,
+		HardState: raftcore.HardState{Term: 3, Commit: 2}, Entries: entries,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.nodes[1] = core
+	// Retaining an incoming suffix must discard a previously retained longer
+	// tail. The initial batch replaces from index 1, including a new term at 2.
+	s.storedEntries[1] = []*raftv1.Entry{
+		entries[0],
+		{Index: 2, Term: 2, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL},
+		{Index: 3, Term: 2, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL},
+		{Index: 4, Term: 2, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL},
+	}
+	if err := s.finish(core, core.Status()); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.storedEntries[1]) != 3 || len(s.appliedEntries[1]) != 2 || core.Status().AppliedIndex != 2 ||
+		s.stored[1] != (raftcore.HardState{Term: 3, Commit: 2}) {
+		t.Fatal("log batch was not retained and applied before Advance")
+	}
+	for i, entry := range entries {
+		if !proto.Equal(s.storedEntries[1][i], entry) {
+			t.Fatalf("wrong retained entry at index %d", i+1)
+		}
+		if i < 2 && !proto.Equal(s.appliedEntries[1][i], entry) {
+			t.Fatalf("wrong applied entry at index %d", i+1)
+		}
+	}
+	trace := s.Trace()
+	retained := strings.Index(trace, "save_entries node=1 first=1 count=3")
+	committed := strings.Index(trace, "save node=1 term=3 vote=0 commit=2")
+	first := strings.Index(trace, "apply node=1 index=1 ")
+	second := strings.Index(trace, "apply node=1 index=2 ")
+	if retained < 0 || committed <= retained || first <= committed || second <= first {
+		t.Fatal("entries and commitment were not retained before ordered application")
+	}
+	if err := s.finish(core, core.Status()); err != nil {
+		t.Fatal(err)
+	}
+	if s.Trace() != trace || len(s.appliedEntries[1]) != 2 {
+		t.Fatal("an acknowledged batch was processed twice")
+	}
+	// New copied the input; later caller mutations cannot affect retained/apply
+	// history, whose entries are independently owned Ready output.
+	entries[0].Data[0] = 'x'
+	if string(s.storedEntries[1][0].Data) != "first" || string(s.appliedEntries[1][0].Data) != "first" {
+		t.Fatal("retained or applied entries alias constructor input")
 	}
 }
 

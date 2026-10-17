@@ -1,6 +1,7 @@
 // Package raftcore implements the single-threaded Raft state machine. Callers
 // supply logical ticks and messages; the core performs no I/O and reads no clock.
-// It currently implements elections and leader heartbeats, without replication.
+// It currently implements elections, an in-memory log and leader heartbeats;
+// replication message handling is introduced separately.
 package raftcore
 
 import (
@@ -27,11 +28,12 @@ var (
 	ErrUnsupportedMessage = errors.New("message type is not implemented")
 )
 
-// HardState is the election state to retain before releasing dependent messages.
-// M1 consumers retain it in memory; this does not provide crash durability.
+// HardState is retained with log entries before releasing dependent messages.
+// Consumers currently retain it in memory; this does not provide crash durability.
 type HardState struct {
-	Term uint64
-	Vote uint64 // zero means no vote in this term
+	Term   uint64
+	Vote   uint64 // zero means no vote in this term
+	Commit uint64
 }
 
 type Config struct {
@@ -45,17 +47,24 @@ type Config struct {
 	Seed           uint64 // zero is a valid deterministic seed
 
 	HardState HardState
-	// Fixed metadata until M2 introduces the mutable log.
-	LastLogIndex uint64
-	LastLogTerm  uint64
+	// Entries is the complete initial log, starting at index 1; New copies it.
+	// The initial Ready emits the entire log for retention and its committed
+	// prefix for application. There is no previously applied state or snapshot.
+	Entries []*raftv1.Entry
 }
 
 // Ready is a caller-owned snapshot. A nil HardState means it is unchanged.
-// Process exactly one snapshot per batch: retain HardState, release Messages,
-// then Advance. Repeated Ready calls return independent copies of the same batch.
+// Process exactly one snapshot per batch: retain Entries and HardState, release
+// Messages, apply CommittedEntries in order, then Advance. Repeated Ready calls
+// return independent copies of the same batch, including nested entry data.
 type Ready struct {
 	HardState *HardState
-	Messages  []*raftv1.Message
+	// Entries replaces the retained suffix starting at Entries[0].Index.
+	Entries  []*raftv1.Entry
+	Messages []*raftv1.Message
+	// CommittedEntries includes no-ops; consumers advance their applied position
+	// for every entry, executing only normal commands.
+	CommittedEntries []*raftv1.Entry
 }
 
 // Status is a value snapshot and can be changed without affecting the core.
@@ -66,6 +75,7 @@ type Status struct {
 	HardState       HardState
 	LastLogIndex    uint64
 	LastLogTerm     uint64
+	AppliedIndex    uint64 // acknowledged by Advance, never merely by Ready
 	ElectionElapsed int
 	ElectionTimeout int
 }
@@ -80,8 +90,9 @@ type Core struct {
 	role           Role
 	leaderID       uint64
 	hardState      HardState
-	lastLogIndex   uint64
-	lastLogTerm    uint64
+	log            []*raftv1.Entry // index i is stored at log[i-1]; no compaction yet
+	unstableFrom   uint64          // first index needing retention; last index + 1 if none
+	appliedIndex   uint64
 	votes          map[uint64]bool
 
 	electionElapsed  int
@@ -113,8 +124,22 @@ func New(cfg Config) (*Core, error) {
 	if cfg.HardState.Vote != 0 && (cfg.HardState.Term == 0 || !slices.Contains(voters, cfg.HardState.Vote)) {
 		return nil, errors.New("initial vote must name a voter in a positive term")
 	}
-	if (cfg.LastLogIndex == 0) != (cfg.LastLogTerm == 0) || cfg.LastLogTerm > cfg.HardState.Term {
-		return nil, errors.New("last log index and term must both be zero or positive, with log term no greater than current term")
+	var previousTerm uint64
+	for i, entry := range cfg.Entries {
+		if entry == nil || entry.Index != uint64(i)+1 || entry.Term == 0 ||
+			entry.Term < previousTerm || entry.Term > cfg.HardState.Term {
+			return nil, errors.New("initial log must have contiguous indices from 1 and positive, nondecreasing terms no greater than current term")
+		}
+		if entry.Type != raftv1.EntryType_ENTRY_TYPE_NORMAL && entry.Type != raftv1.EntryType_ENTRY_TYPE_NO_OP {
+			return nil, errors.New("initial log contains an unsupported entry type")
+		}
+		if entry.Type == raftv1.EntryType_ENTRY_TYPE_NO_OP && len(entry.Data) != 0 {
+			return nil, errors.New("no-op entries must not carry data")
+		}
+		previousTerm = entry.Term
+	}
+	if cfg.HardState.Commit > uint64(len(cfg.Entries)) {
+		return nil, errors.New("initial commit index exceeds the last log index")
 	}
 	rng := rand.New(rand.NewPCG(cfg.Seed, 0))
 	return &Core{
@@ -125,8 +150,8 @@ func New(cfg Config) (*Core, error) {
 		rng:             rng,
 		role:            Follower,
 		hardState:       cfg.HardState,
-		lastLogIndex:    cfg.LastLogIndex,
-		lastLogTerm:     cfg.LastLogTerm,
+		log:             cloneEntries(cfg.Entries),
+		unstableFrom:    1,
 		electionTimeout: cfg.ElectionTicks + rng.IntN(cfg.ElectionTicks),
 	}, nil
 }
@@ -163,8 +188,8 @@ func (c *Core) Tick() error {
 					From:         c.id,
 					To:           peer,
 					Term:         c.hardState.Term,
-					LastLogIndex: c.lastLogIndex,
-					LastLogTerm:  c.lastLogTerm,
+					LastLogIndex: c.lastLogIndex(),
+					LastLogTerm:  c.lastLogTerm(),
 				})
 			}
 		}
@@ -195,6 +220,10 @@ func (c *Core) Step(msg *raftv1.Message) error {
 	default:
 		return fmt.Errorf("%w: %s", ErrUnsupportedMessage, msg.Type)
 	}
+	if msg.PrevLogIndex != 0 || msg.PrevLogTerm != 0 || len(msg.Entries) != 0 ||
+		msg.LeaderCommit != 0 || msg.MatchIndex != 0 || msg.ConflictTerm != 0 || msg.ConflictIndex != 0 {
+		return errors.New("election messages must not carry replication fields")
+	}
 	if msg.Term == 0 {
 		return errors.New("election messages require a positive term")
 	}
@@ -209,8 +238,8 @@ func (c *Core) Step(msg *raftv1.Message) error {
 		c.becomeFollower(msg.Term, 0)
 	}
 	if msg.Type == raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE {
-		upToDate := msg.LastLogTerm > c.lastLogTerm ||
-			(msg.LastLogTerm == c.lastLogTerm && msg.LastLogIndex >= c.lastLogIndex)
+		upToDate := msg.LastLogTerm > c.lastLogTerm() ||
+			(msg.LastLogTerm == c.lastLogTerm() && msg.LastLogIndex >= c.lastLogIndex())
 		grant := msg.Term == c.hardState.Term && upToDate &&
 			(c.hardState.Vote == 0 || c.hardState.Vote == msg.From)
 		if grant {
@@ -240,7 +269,8 @@ func (c *Core) resetElectionTimer() {
 
 func (c *Core) becomeFollower(term, leaderID uint64) {
 	if term > c.hardState.Term {
-		c.hardState = HardState{Term: term}
+		c.hardState.Term = term
+		c.hardState.Vote = 0
 	}
 	c.role = Follower
 	c.leaderID = leaderID
@@ -279,7 +309,7 @@ func (c *Core) broadcastHeartbeat() {
 	}
 }
 
-// Ready emits initial state once, then only state changes and queued messages.
+// Ready emits state changes, changed log suffixes, messages and committed entries.
 // Calling Ready with no output does not create a batch requiring Advance.
 func (c *Core) Ready() Ready {
 	var rd Ready
@@ -287,22 +317,27 @@ func (c *Core) Ready() Ready {
 		state := c.hardState
 		rd.HardState = &state
 	}
+	rd.Entries = cloneEntries(c.log[c.unstableFrom-1:])
 	for _, msg := range c.messages {
 		rd.Messages = append(rd.Messages, proto.Clone(msg).(*raftv1.Message))
 	}
-	if rd.HardState != nil || len(rd.Messages) != 0 {
+	rd.CommittedEntries = cloneEntries(c.log[c.appliedIndex:c.hardState.Commit])
+	if rd.HardState != nil || len(rd.Entries) != 0 || len(rd.Messages) != 0 || len(rd.CommittedEntries) != 0 {
 		c.readyPending = true
 	}
 	return rd
 }
 
 // Advance acknowledges that the outstanding batch was processed successfully.
-// On a save/send failure, retry that batch rather than advancing the core.
+// On a save/send/apply failure, finish the outstanding batch before advancing.
+// Consumers must track partial application so retrying does not execute it twice.
 func (c *Core) Advance() error {
 	if !c.readyPending {
 		return ErrNoReady
 	}
 	c.savedState = c.hardState
+	c.unstableFrom = c.lastLogIndex() + 1
+	c.appliedIndex = c.hardState.Commit
 	c.initialized = true
 	c.messages = nil
 	c.readyPending = false
@@ -315,9 +350,27 @@ func (c *Core) Status() Status {
 		Role:            c.role,
 		LeaderID:        c.leaderID,
 		HardState:       c.hardState,
-		LastLogIndex:    c.lastLogIndex,
-		LastLogTerm:     c.lastLogTerm,
+		LastLogIndex:    c.lastLogIndex(),
+		LastLogTerm:     c.lastLogTerm(),
+		AppliedIndex:    c.appliedIndex,
 		ElectionElapsed: c.electionElapsed,
 		ElectionTimeout: c.electionTimeout,
 	}
+}
+
+func (c *Core) lastLogIndex() uint64 { return uint64(len(c.log)) }
+
+func (c *Core) lastLogTerm() uint64 {
+	if len(c.log) == 0 {
+		return 0
+	}
+	return c.log[len(c.log)-1].Term
+}
+
+func cloneEntries(entries []*raftv1.Entry) []*raftv1.Entry {
+	var cloned []*raftv1.Entry
+	for _, entry := range entries {
+		cloned = append(cloned, proto.Clone(entry).(*raftv1.Entry))
+	}
+	return cloned
 }

@@ -20,7 +20,7 @@ func newElectionCore(t *testing.T, cfg Config) *Core {
 func takeReady(t *testing.T, core *Core) Ready {
 	t.Helper()
 	rd := core.Ready()
-	if rd.HardState != nil || len(rd.Messages) > 0 {
+	if rd.HardState != nil || len(rd.Entries) > 0 || len(rd.Messages) > 0 || len(rd.CommittedEntries) > 0 {
 		if err := core.Advance(); err != nil {
 			t.Fatal(err)
 		}
@@ -53,7 +53,7 @@ func expireElection(t *testing.T, core *Core) Ready {
 func TestCampaignAndRetry(t *testing.T) {
 	cfg := config()
 	cfg.HardState.Term = 3
-	cfg.LastLogIndex, cfg.LastLogTerm = 10, 2
+	cfg.Entries = entriesWithTerm(10, 2)
 	core := newElectionCore(t, cfg)
 	for term := uint64(4); term <= 5; term++ {
 		rd := expireElection(t, core)
@@ -117,22 +117,22 @@ func TestRequestVoteRules(t *testing.T) {
 		grant                   bool
 		wantState               HardState
 	}{
-		{"equal log", 0, 4, 10, 2, true, HardState{4, 2}},
-		{"longer log", 0, 4, 11, 2, true, HardState{4, 2}},
-		{"shorter log", 0, 4, 9, 2, false, HardState{4, 0}},
-		{"newer log term wins over length", 0, 4, 1, 3, true, HardState{4, 2}},
-		{"older log term loses despite length", 0, 4, 100, 1, false, HardState{4, 0}},
-		{"empty log is stale", 0, 4, 0, 0, false, HardState{4, 0}},
-		{"repeat vote for same candidate", 2, 4, 10, 2, true, HardState{4, 2}},
-		{"already voted for another", 3, 4, 10, 2, false, HardState{4, 3}},
-		{"stale term", 0, 3, 100, 3, false, HardState{4, 0}},
-		{"higher term clears old vote", 3, 5, 10, 2, true, HardState{5, 2}},
-		{"higher term with stale log", 3, 5, 100, 1, false, HardState{5, 0}},
+		{"equal log", 0, 4, 10, 2, true, HardState{Term: 4, Vote: 2}},
+		{"longer log", 0, 4, 11, 2, true, HardState{Term: 4, Vote: 2}},
+		{"shorter log", 0, 4, 9, 2, false, HardState{Term: 4}},
+		{"newer log term wins over length", 0, 4, 1, 3, true, HardState{Term: 4, Vote: 2}},
+		{"older log term loses despite length", 0, 4, 100, 1, false, HardState{Term: 4}},
+		{"empty log is stale", 0, 4, 0, 0, false, HardState{Term: 4}},
+		{"repeat vote for same candidate", 2, 4, 10, 2, true, HardState{Term: 4, Vote: 2}},
+		{"already voted for another", 3, 4, 10, 2, false, HardState{Term: 4, Vote: 3}},
+		{"stale term", 0, 3, 100, 3, false, HardState{Term: 4}},
+		{"higher term clears old vote", 3, 5, 10, 2, true, HardState{Term: 5, Vote: 2}},
+		{"higher term with stale log", 3, 5, 100, 1, false, HardState{Term: 5}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := config()
 			cfg.HardState = HardState{Term: 4, Vote: tc.initialVote}
-			cfg.LastLogIndex, cfg.LastLogTerm = 10, 2
+			cfg.Entries = entriesWithTerm(10, 2)
 			core := newElectionCore(t, cfg)
 			for range 3 {
 				if err := core.Tick(); err != nil {
@@ -192,7 +192,7 @@ func TestHigherTermStepsDownEveryRole(t *testing.T) {
 					vote = 2
 				}
 				status := core.Status()
-				if status.Role != Follower || status.LeaderID != 0 || status.HardState != (HardState{term, vote}) || status.ElectionElapsed != 0 {
+				if status.Role != Follower || status.LeaderID != 0 || status.HardState != (HardState{Term: term, Vote: vote}) || status.ElectionElapsed != 0 {
 					t.Fatalf("higher term failed to clear old leadership/campaign: %+v", status)
 				}
 				if rd.HardState == nil || *rd.HardState != status.HardState || len(core.votes) != 0 {
@@ -274,7 +274,7 @@ func TestSingleVoterAndTermExhaustion(t *testing.T) {
 	cfg.Voters = []uint64{1}
 	core := newElectionCore(t, cfg)
 	rd := expireElection(t, core)
-	if status := core.Status(); status.Role != Leader || status.LeaderID != 1 || status.HardState != (HardState{1, 1}) || len(rd.Messages) != 0 {
+	if status := core.Status(); status.Role != Leader || status.LeaderID != 1 || status.HardState != (HardState{Term: 1, Vote: 1}) || len(rd.Messages) != 0 {
 		t.Fatalf("single voter failed to self-elect: %+v", status)
 	}
 	for range 2 * cfg.ElectionTicks {

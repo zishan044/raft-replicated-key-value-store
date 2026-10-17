@@ -12,6 +12,7 @@ import (
 
 	"github.com/zishan044/raft-replicated-key-value-store.git/internal/raftcore"
 	raftv1 "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 type Config struct {
@@ -43,19 +44,21 @@ type delivery struct {
 // Simulator must be owned by one goroutine. A failed Tick is terminal; later
 // Tick/Run calls return the original failure with its seed and logical time.
 type Simulator struct {
-	seed    uint64
-	now     int
-	voters  []uint64
-	nodes   map[uint64]*raftcore.Core
-	stored  map[uint64]raftcore.HardState
-	leaders map[uint64]uint64 // term -> first leader ever observed in that term
-	rng     *rand.Rand
-	faults  Faults
-	blocked map[link]bool
-	queue   []delivery
-	serial  uint64
-	trace   []string
-	err     error
+	seed           uint64
+	now            int
+	voters         []uint64
+	nodes          map[uint64]*raftcore.Core
+	stored         map[uint64]raftcore.HardState
+	storedEntries  map[uint64][]*raftv1.Entry
+	appliedEntries map[uint64][]*raftv1.Entry
+	leaders        map[uint64]uint64 // term -> first leader ever observed in that term
+	rng            *rand.Rand
+	faults         Faults
+	blocked        map[link]bool
+	queue          []delivery
+	serial         uint64
+	trace          []string
+	err            error
 }
 
 func New(cfg Config) (*Simulator, error) {
@@ -78,6 +81,7 @@ func New(cfg Config) (*Simulator, error) {
 	s := &Simulator{
 		seed: cfg.Seed, voters: cfg.Voters,
 		nodes: make(map[uint64]*raftcore.Core), stored: make(map[uint64]raftcore.HardState),
+		storedEntries: make(map[uint64][]*raftv1.Entry), appliedEntries: make(map[uint64][]*raftv1.Entry),
 		leaders: make(map[uint64]uint64), blocked: make(map[link]bool),
 		rng: rand.New(rand.NewPCG(cfg.Seed, 0)), faults: Faults{MinDelay: 1, MaxDelay: 1},
 	}
@@ -246,14 +250,33 @@ func (s *Simulator) finish(core *raftcore.Core, before raftcore.Status) error {
 		return err
 	}
 	rd := core.Ready()
+	if len(rd.Entries) > 0 {
+		first := rd.Entries[0].Index
+		stored := s.storedEntries[status.ID]
+		if first == 0 || first > uint64(len(stored))+1 {
+			return fmt.Errorf("node %d: retained log has a gap before index %d", status.ID, first)
+		}
+		// Ready transfers ownership of these entry copies to the consumer.
+		s.storedEntries[status.ID] = append(stored[:first-1], rd.Entries...)
+		s.log("save_entries node=%d first=%d count=%d", status.ID, first, len(rd.Entries))
+	}
 	if rd.HardState != nil {
 		s.stored[status.ID] = *rd.HardState
-		s.log("save node=%d term=%d vote=%d", status.ID, rd.HardState.Term, rd.HardState.Vote)
+		s.log("save node=%d term=%d vote=%d commit=%d", status.ID, rd.HardState.Term, rd.HardState.Vote, rd.HardState.Commit)
 	}
 	for _, msg := range rd.Messages {
 		s.enqueue(msg)
 	}
-	if rd.HardState != nil || len(rd.Messages) > 0 {
+	for _, entry := range rd.CommittedEntries {
+		stored := s.storedEntries[status.ID]
+		if entry.Index != uint64(len(s.appliedEntries[status.ID]))+1 || entry.Index > s.stored[status.ID].Commit ||
+			entry.Index > uint64(len(stored)) || !proto.Equal(entry, stored[entry.Index-1]) {
+			return fmt.Errorf("node %d: application at index %d is out of order or not retained and committed", status.ID, entry.Index)
+		}
+		s.appliedEntries[status.ID] = append(s.appliedEntries[status.ID], entry)
+		s.log("apply node=%d index=%d term=%d type=%s", status.ID, entry.Index, entry.Term, entry.Type)
+	}
+	if rd.HardState != nil || len(rd.Entries) > 0 || len(rd.Messages) > 0 || len(rd.CommittedEntries) > 0 {
 		return core.Advance()
 	}
 	return nil

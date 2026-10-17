@@ -4,7 +4,8 @@ package raft.v1;
 
 option go_package = "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1;raftv1";
 
-// MessageType identifies the election messages supported by the peer protocol.
+// MessageType identifies messages in the peer protocol. Append handling is
+// introduced after the log and output contracts.
 enum MessageType {
   MESSAGE_TYPE_UNSPECIFIED = 0;
   MESSAGE_TYPE_PRE_VOTE = 1;
@@ -13,9 +14,26 @@ enum MessageType {
   MESSAGE_TYPE_REQUEST_VOTE_RESPONSE = 4;
   // Leader contact only; log replication is introduced separately.
   MESSAGE_TYPE_HEARTBEAT = 5;
+  MESSAGE_TYPE_APPEND_ENTRIES = 6;
+  MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE = 7;
 }
 
-// Message carries an election request, response, or heartbeat between Raft nodes.
+enum EntryType {
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_NORMAL = 1;
+  ENTRY_TYPE_NO_OP = 2;
+}
+
+// Entry is an immutable command or election no-op at a positive log position.
+message Entry {
+  uint64 term = 1;
+  uint64 index = 2;
+  EntryType type = 3;
+  // No-op entries have no data; normal entry data is opaque to Raft.
+  bytes data = 4;
+}
+
+// Message carries an election or replication message between Raft nodes.
 message Message {
   MessageType type = 1;
   // Node IDs are positive; zero is not a valid sender or recipient.
@@ -27,6 +45,19 @@ message Message {
   // log). Heartbeats leave both fields zero.
   uint64 last_log_index = 5;
   uint64 last_log_term = 6;
-  // Responses set reject when the vote is denied; requests leave it false.
+  // Responses set reject when a vote or append is denied.
   bool reject = 7;
+  // Appends name the preceding entry (both zero at the start of the log).
+  // Append responses echo prev_log_index to identify the request being answered.
+  uint64 prev_log_index = 8;
+  uint64 prev_log_term = 9;
+  repeated Entry entries = 10;
+  uint64 leader_commit = 11;
+  // Successful append responses acknowledge the last index matched by the
+  // request, which can be smaller than the follower's local last index.
+  uint64 match_index = 12;
+  // Rejections report the conflicting term and its first index. A missing
+  // preceding entry uses term zero and the follower's last index plus one.
+  uint64 conflict_term = 13;
+  uint64 conflict_index = 14;
 }
