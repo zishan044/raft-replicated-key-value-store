@@ -154,7 +154,7 @@ func TestHigherTermsPreserveCommit(t *testing.T) {
 	for _, kind := range []raftv1.MessageType{
 		raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE,
 		raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE,
-		raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT,
+		raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES,
 	} {
 		t.Run(kind.String(), func(t *testing.T) {
 			cfg := config()
@@ -162,8 +162,11 @@ func TestHigherTermsPreserveCommit(t *testing.T) {
 			cfg.Entries = entriesWithTerm(2, 2)
 			core := newElectionCore(t, cfg)
 			msg := &raftv1.Message{Type: kind, From: 2, To: 1, Term: 4}
-			if kind == raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE {
+			switch kind {
+			case raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE:
 				msg.LastLogIndex, msg.LastLogTerm = 2, 2
+			case raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES:
+				msg.PrevLogIndex, msg.PrevLogTerm = 2, 2
 			}
 			rd := stepElection(t, core, msg)
 			wantVote := uint64(0)
@@ -182,7 +185,6 @@ func TestElectionMessagesRejectReplicationFields(t *testing.T) {
 	for _, kind := range []raftv1.MessageType{
 		raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE,
 		raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE,
-		raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT,
 	} {
 		core := newElectionCore(t, config())
 		before := core.Status()

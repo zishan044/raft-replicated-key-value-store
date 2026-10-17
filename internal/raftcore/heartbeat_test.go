@@ -13,127 +13,85 @@ func TestHeartbeatTiming(t *testing.T) {
 	cfg.HeartbeatTicks = 3
 	core := newElectionCore(t, cfg)
 	expireElection(t, core)
-	check := func(rd Ready) {
-		t.Helper()
-		if rd.HardState != nil || len(rd.Messages) != 2 {
-			t.Fatalf("expected two heartbeats without unchanged hard state: %+v", rd)
-		}
-		for i, msg := range rd.Messages {
-			want := &raftv1.Message{Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT, From: 1, To: uint64(i + 2), Term: 1}
-			if !proto.Equal(msg, want) {
-				t.Fatalf("heartbeat: got %v, want %v", msg, want)
-			}
+	rd := stepElection(t, core, &raftv1.Message{Type: raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE, From: 2, To: 1, Term: 1})
+	if len(rd.Entries) != 1 || rd.Entries[0].Type != raftv1.EntryType_ENTRY_TYPE_NO_OP || len(rd.Messages) != 2 {
+		t.Fatalf("election must append and broadcast a no-op: %+v", rd)
+	}
+	for _, msg := range rd.Messages {
+		if msg.Type != raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES || msg.PrevLogIndex != 0 || !equalEntries(msg.Entries, rd.Entries) {
+			t.Fatalf("election did not send its no-op: %v", msg)
 		}
 	}
-	check(stepElection(t, core, &raftv1.Message{Type: raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE, From: 2, To: 1, Term: 1}))
+	// Catch both peers up so idle ticks send empty appends rather than retries.
+	for _, peer := range []uint64{2, 3} {
+		stepElection(t, core, &raftv1.Message{
+			Type: raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE,
+			From: peer, To: 1, Term: 1, MatchIndex: 1,
+		})
+	}
 	for range 3 {
 		for tick := 1; tick <= cfg.HeartbeatTicks; tick++ {
 			if err := core.Tick(); err != nil {
 				t.Fatal(err)
 			}
 			rd := takeReady(t, core)
-			if tick == cfg.HeartbeatTicks {
-				check(rd)
-			} else if rd.HardState != nil || len(rd.Messages) != 0 {
-				t.Fatal("heartbeat emitted before its interval")
+			if tick != cfg.HeartbeatTicks {
+				if len(rd.Messages) != 0 {
+					t.Fatal("heartbeat emitted before its interval")
+				}
+				continue
+			}
+			if rd.HardState != nil || len(rd.Entries) != 0 || len(rd.Messages) != 2 {
+				t.Fatalf("expected two idle appends: %+v", rd)
+			}
+			for i, msg := range rd.Messages {
+				want := &raftv1.Message{
+					Type: raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES,
+					From: 1, To: uint64(i + 2), Term: 1,
+					PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 1,
+				}
+				if !proto.Equal(msg, want) {
+					t.Fatalf("idle append: got %v, want %v", msg, want)
+				}
 			}
 		}
 	}
-	if status := core.Status(); status.Role != Leader || status.HardState.Term != 1 {
-		t.Fatalf("heartbeat ticks disrupted leadership: %+v", status)
+}
+
+func TestEmptyAppendPreservesVoteInTerm(t *testing.T) {
+	core := newElectionCore(t, config())
+	expireElection(t, core)
+	rd := stepElection(t, core, appendRequest(1, 0, 0))
+	if core.Status().Role != Follower || core.Status().HardState.Vote != 1 || len(rd.Messages) != 1 || rd.Messages[0].Reject {
+		t.Fatal("same-term leader contact did not preserve the candidate's vote")
+	}
+	rd = stepElection(t, core, &raftv1.Message{Type: raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE, From: 2, To: 1, Term: 1})
+	if len(rd.Messages) != 1 || !rd.Messages[0].Reject {
+		t.Fatal("same-term leader contact allowed a second vote")
 	}
 }
 
-func TestHeartbeatTermAndRoleHandling(t *testing.T) {
-	for _, role := range []Role{Follower, Candidate, Leader} {
-		for _, delta := range []int{-1, 0, 1} {
-			t.Run(fmt.Sprintf("%s/term_delta_%d", role, delta), func(t *testing.T) {
-				cfg := config()
-				cfg.HardState = HardState{Term: 2, Vote: 3}
-				core := newElectionCore(t, cfg)
-				if role != Follower {
-					expireElection(t, core)
-				}
-				if role == Leader {
-					stepElection(t, core, &raftv1.Message{Type: raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE, From: 2, To: 1, Term: 3})
-				}
-				for range 3 {
-					if err := core.Tick(); err != nil {
-						t.Fatal(err)
-					}
-					takeReady(t, core)
-				}
-				before := core.Status()
-				term := uint64(int(before.HardState.Term) + delta)
-				rd := stepElection(t, core, &raftv1.Message{Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT, From: 2, To: 1, Term: term})
-				status := core.Status()
-				if len(rd.Messages) != 0 {
-					t.Fatal("heartbeats must not generate acknowledgements in M1")
-				}
-				if delta < 0 {
-					if status != before || rd.HardState != nil {
-						t.Fatal("stale heartbeat changed state or reset the election timer")
-					}
-					return
-				}
-				wantState := before.HardState
-				if delta > 0 {
-					wantState = HardState{Term: term}
-					if rd.HardState == nil || *rd.HardState != wantState {
-						t.Fatal("higher-term heartbeat did not emit the new term")
-					}
-				} else if rd.HardState != nil {
-					t.Fatal("same-term heartbeat rewrote hard state")
-				}
-				if status.Role != Follower || status.LeaderID != 2 || status.HardState != wantState ||
-					status.ElectionElapsed != 0 || len(core.votes) != 0 {
-					t.Fatalf("heartbeat did not establish leader contact: %+v", status)
-				}
-				if delta == 0 {
-					rd = stepElection(t, core, &raftv1.Message{Type: raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE, From: 2, To: 1, Term: term})
-					if len(rd.Messages) != 1 || !rd.Messages[0].Reject {
-						t.Fatal("same-term heartbeat allowed a second vote")
-					}
-				}
-			})
-		}
-	}
-}
-
-func TestHeartbeatValidationAndStaleTimeout(t *testing.T) {
+func TestStaleEmptyAppendDoesNotSuppressElection(t *testing.T) {
 	cfg := config()
 	cfg.HardState.Term = 2
 	core := newElectionCore(t, cfg)
-	before := core.Status()
-	for _, msg := range []*raftv1.Message{
-		{Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT, From: 2, To: 1},
-		{Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT, From: 9, To: 1, Term: 99},
-		{Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT, From: 2, To: 3, Term: 99},
-		{Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT, From: 2, To: 1, Term: 99, Reject: true},
-		{Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT, From: 2, To: 1, Term: 99, LastLogIndex: 1},
-		{Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT, From: 2, To: 1, Term: 99, LastLogTerm: 1},
-	} {
-		if err := core.Step(msg); err == nil || core.Status() != before {
-			t.Fatalf("invalid heartbeat changed state or was accepted: %v, err=%v", msg, err)
-		}
-	}
-	for range before.ElectionTimeout - 1 {
+	for range core.Status().ElectionTimeout - 1 {
 		if err := core.Tick(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	stepElection(t, core, &raftv1.Message{Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT, From: 2, To: 1, Term: 1})
+	stepElection(t, core, appendRequest(1, 0, 0))
 	if err := core.Tick(); err != nil {
 		t.Fatal(err)
 	}
 	rd := takeReady(t, core)
 	if core.Status().Role != Candidate || rd.HardState == nil || rd.HardState.Term != 3 {
-		t.Fatal("stale heartbeat suppressed an election")
+		t.Fatal("stale empty append suppressed an election")
 	}
 }
 
 // Direct delivery only: fault scheduling and virtual network queues belong to
-// the simulator in subset 4. IDs in these tests are contiguous and start at 1.
+// the simulator. IDs in these tests are contiguous and start at 1.
 func deliverMessages(t *testing.T, nodes []*Core, messages []*raftv1.Message, isolated uint64) {
 	t.Helper()
 	for i := 0; i < len(messages); i++ {

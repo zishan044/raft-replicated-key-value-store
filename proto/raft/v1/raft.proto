@@ -4,16 +4,17 @@ package raft.v1;
 
 option go_package = "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1;raftv1";
 
-// MessageType identifies messages in the peer protocol. Append handling is
-// introduced after the log and output contracts.
+// MessageType identifies messages in the peer protocol.
 enum MessageType {
+  // Leader contact now uses empty AppendEntries.
+  reserved 5;
+  reserved "MESSAGE_TYPE_HEARTBEAT";
+
   MESSAGE_TYPE_UNSPECIFIED = 0;
   MESSAGE_TYPE_PRE_VOTE = 1;
   MESSAGE_TYPE_PRE_VOTE_RESPONSE = 2;
   MESSAGE_TYPE_REQUEST_VOTE = 3;
   MESSAGE_TYPE_REQUEST_VOTE_RESPONSE = 4;
-  // Leader contact only; log replication is introduced separately.
-  MESSAGE_TYPE_HEARTBEAT = 5;
   MESSAGE_TYPE_APPEND_ENTRIES = 6;
   MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE = 7;
 }
@@ -42,7 +43,7 @@ message Message {
   // For a PreVote request, term is the proposed election term.
   uint64 term = 4;
   // Vote requests carry the candidate's last log position (both zero for an empty
-  // log). Heartbeats leave both fields zero.
+  // log). Replication messages leave both fields zero.
   uint64 last_log_index = 5;
   uint64 last_log_term = 6;
   // Responses set reject when a vote or append is denied.
@@ -56,8 +57,9 @@ message Message {
   // Successful append responses acknowledge the last index matched by the
   // request, which can be smaller than the follower's local last index.
   uint64 match_index = 12;
-  // Rejections report the conflicting term and its first index. A missing
-  // preceding entry uses term zero and the follower's last index plus one.
+  // Log-prefix rejections report the conflicting term and its first index. A
+  // missing preceding entry uses term zero and the follower's last index plus
+  // one. Stale-term rejections leave both hints zero.
   uint64 conflict_term = 13;
   uint64 conflict_index = 14;
 }

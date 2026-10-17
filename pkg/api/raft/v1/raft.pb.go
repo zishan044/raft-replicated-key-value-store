@@ -21,18 +21,15 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// MessageType identifies messages in the peer protocol. Append handling is
-// introduced after the log and output contracts.
+// MessageType identifies messages in the peer protocol.
 type MessageType int32
 
 const (
-	MessageType_MESSAGE_TYPE_UNSPECIFIED           MessageType = 0
-	MessageType_MESSAGE_TYPE_PRE_VOTE              MessageType = 1
-	MessageType_MESSAGE_TYPE_PRE_VOTE_RESPONSE     MessageType = 2
-	MessageType_MESSAGE_TYPE_REQUEST_VOTE          MessageType = 3
-	MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE MessageType = 4
-	// Leader contact only; log replication is introduced separately.
-	MessageType_MESSAGE_TYPE_HEARTBEAT               MessageType = 5
+	MessageType_MESSAGE_TYPE_UNSPECIFIED             MessageType = 0
+	MessageType_MESSAGE_TYPE_PRE_VOTE                MessageType = 1
+	MessageType_MESSAGE_TYPE_PRE_VOTE_RESPONSE       MessageType = 2
+	MessageType_MESSAGE_TYPE_REQUEST_VOTE            MessageType = 3
+	MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE   MessageType = 4
 	MessageType_MESSAGE_TYPE_APPEND_ENTRIES          MessageType = 6
 	MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE MessageType = 7
 )
@@ -45,7 +42,6 @@ var (
 		2: "MESSAGE_TYPE_PRE_VOTE_RESPONSE",
 		3: "MESSAGE_TYPE_REQUEST_VOTE",
 		4: "MESSAGE_TYPE_REQUEST_VOTE_RESPONSE",
-		5: "MESSAGE_TYPE_HEARTBEAT",
 		6: "MESSAGE_TYPE_APPEND_ENTRIES",
 		7: "MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE",
 	}
@@ -55,7 +51,6 @@ var (
 		"MESSAGE_TYPE_PRE_VOTE_RESPONSE":       2,
 		"MESSAGE_TYPE_REQUEST_VOTE":            3,
 		"MESSAGE_TYPE_REQUEST_VOTE_RESPONSE":   4,
-		"MESSAGE_TYPE_HEARTBEAT":               5,
 		"MESSAGE_TYPE_APPEND_ENTRIES":          6,
 		"MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE": 7,
 	}
@@ -217,7 +212,7 @@ type Message struct {
 	// For a PreVote request, term is the proposed election term.
 	Term uint64 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
 	// Vote requests carry the candidate's last log position (both zero for an empty
-	// log). Heartbeats leave both fields zero.
+	// log). Replication messages leave both fields zero.
 	LastLogIndex uint64 `protobuf:"varint,5,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
 	LastLogTerm  uint64 `protobuf:"varint,6,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
 	// Responses set reject when a vote or append is denied.
@@ -231,8 +226,9 @@ type Message struct {
 	// Successful append responses acknowledge the last index matched by the
 	// request, which can be smaller than the follower's local last index.
 	MatchIndex uint64 `protobuf:"varint,12,opt,name=match_index,json=matchIndex,proto3" json:"match_index,omitempty"`
-	// Rejections report the conflicting term and its first index. A missing
-	// preceding entry uses term zero and the follower's last index plus one.
+	// Log-prefix rejections report the conflicting term and its first index. A
+	// missing preceding entry uses term zero and the follower's last index plus
+	// one. Stale-term rejections leave both hints zero.
 	ConflictTerm  uint64 `protobuf:"varint,13,opt,name=conflict_term,json=conflictTerm,proto3" json:"conflict_term,omitempty"`
 	ConflictIndex uint64 `protobuf:"varint,14,opt,name=conflict_index,json=conflictIndex,proto3" json:"conflict_index,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -393,16 +389,15 @@ const file_raft_v1_raft_proto_rawDesc = "" +
 	"\vmatch_index\x18\f \x01(\x04R\n" +
 	"matchIndex\x12#\n" +
 	"\rconflict_term\x18\r \x01(\x04R\fconflictTerm\x12%\n" +
-	"\x0econflict_index\x18\x0e \x01(\x04R\rconflictIndex*\x98\x02\n" +
+	"\x0econflict_index\x18\x0e \x01(\x04R\rconflictIndex*\x9a\x02\n" +
 	"\vMessageType\x12\x1c\n" +
 	"\x18MESSAGE_TYPE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15MESSAGE_TYPE_PRE_VOTE\x10\x01\x12\"\n" +
 	"\x1eMESSAGE_TYPE_PRE_VOTE_RESPONSE\x10\x02\x12\x1d\n" +
 	"\x19MESSAGE_TYPE_REQUEST_VOTE\x10\x03\x12&\n" +
-	"\"MESSAGE_TYPE_REQUEST_VOTE_RESPONSE\x10\x04\x12\x1a\n" +
-	"\x16MESSAGE_TYPE_HEARTBEAT\x10\x05\x12\x1f\n" +
+	"\"MESSAGE_TYPE_REQUEST_VOTE_RESPONSE\x10\x04\x12\x1f\n" +
 	"\x1bMESSAGE_TYPE_APPEND_ENTRIES\x10\x06\x12(\n" +
-	"$MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE\x10\a*T\n" +
+	"$MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE\x10\a\"\x04\b\x05\x10\x05*\x16MESSAGE_TYPE_HEARTBEAT*T\n" +
 	"\tEntryType\x12\x1a\n" +
 	"\x16ENTRY_TYPE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11ENTRY_TYPE_NORMAL\x10\x01\x12\x14\n" +

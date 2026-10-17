@@ -186,7 +186,8 @@ func TestHigherTermStepsDownEveryRole(t *testing.T) {
 					t.Fatal("test failed to establish starting role")
 				}
 				term := core.Status().HardState.Term + 1
-				rd := stepElection(t, core, &raftv1.Message{Type: msgType, From: 2, To: 1, Term: term})
+				rd := stepElection(t, core, &raftv1.Message{Type: msgType, From: 2, To: 1, Term: term,
+					LastLogIndex: core.Status().LastLogIndex, LastLogTerm: core.Status().LastLogTerm})
 				vote := uint64(0)
 				if msgType == raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE {
 					vote = 2
@@ -274,7 +275,7 @@ func TestSingleVoterAndTermExhaustion(t *testing.T) {
 	cfg.Voters = []uint64{1}
 	core := newElectionCore(t, cfg)
 	rd := expireElection(t, core)
-	if status := core.Status(); status.Role != Leader || status.LeaderID != 1 || status.HardState != (HardState{Term: 1, Vote: 1}) || len(rd.Messages) != 0 {
+	if status := core.Status(); status.Role != Leader || status.LeaderID != 1 || status.HardState != (HardState{Term: 1, Vote: 1, Commit: 1}) || len(rd.Messages) != 0 {
 		t.Fatalf("single voter failed to self-elect: %+v", status)
 	}
 	for range 2 * cfg.ElectionTicks {

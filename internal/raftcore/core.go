@@ -1,7 +1,6 @@
 // Package raftcore implements the single-threaded Raft state machine. Callers
 // supply logical ticks and messages; the core performs no I/O and reads no clock.
-// It currently implements elections, an in-memory log, leader heartbeats and
-// follower AppendEntries; leader replication is introduced separately.
+// It implements elections and in-memory log replication with ordered apply.
 package raftcore
 
 import (
@@ -26,7 +25,12 @@ var (
 	ErrReadyPending       = errors.New("advance the outstanding Ready before supplying input")
 	ErrNoReady            = errors.New("no outstanding Ready to advance")
 	ErrUnsupportedMessage = errors.New("message type is not implemented")
+	ErrNotLeader          = errors.New("not leader")
 )
+
+type progress struct {
+	next, match uint64
+}
 
 // HardState is retained with log entries before releasing dependent messages.
 // Consumers currently retain it in memory; this does not provide crash durability.
@@ -94,6 +98,7 @@ type Core struct {
 	unstableFrom   uint64          // first index needing retention; last index + 1 if none
 	appliedIndex   uint64
 	votes          map[uint64]bool
+	progress       map[uint64]*progress // remote voters only; reset on leadership change
 
 	electionElapsed  int
 	electionTimeout  int
@@ -155,7 +160,7 @@ func (c *Core) Tick() error {
 		c.heartbeatElapsed++
 		if c.heartbeatElapsed >= c.heartbeatTicks {
 			c.heartbeatElapsed = 0
-			c.broadcastHeartbeat()
+			c.broadcastAppend()
 		}
 		return nil
 	}
@@ -187,7 +192,7 @@ func (c *Core) Tick() error {
 	return nil
 }
 
-// Step handles votes, heartbeats and follower AppendEntries, copying retained
+// Step handles votes, AppendEntries and append responses, copying retained
 // entries. Unsupported, malformed or committed-conflicting messages leave the
 // core unchanged. Stale appends and log-prefix mismatches produce rejections.
 func (c *Core) Step(msg *raftv1.Message) error {
@@ -203,10 +208,6 @@ func (c *Core) Step(msg *raftv1.Message) error {
 			return errors.New("invalid RequestVote log metadata or reject flag")
 		}
 	case raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE:
-	case raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT:
-		if msg.Reject || msg.LastLogIndex != 0 || msg.LastLogTerm != 0 {
-			return errors.New("heartbeats must not carry vote results or log metadata")
-		}
 	case raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES:
 		if msg.Reject || msg.LastLogIndex != 0 || msg.LastLogTerm != 0 || msg.MatchIndex != 0 ||
 			msg.ConflictTerm != 0 || msg.ConflictIndex != 0 ||
@@ -216,10 +217,21 @@ func (c *Core) Step(msg *raftv1.Message) error {
 		if err := validateEntries(msg.Entries, msg.PrevLogIndex, msg.PrevLogTerm, msg.Term); err != nil {
 			return err
 		}
+	case raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE:
+		if msg.LastLogIndex != 0 || msg.LastLogTerm != 0 || msg.PrevLogTerm != 0 || len(msg.Entries) != 0 || msg.LeaderCommit != 0 ||
+			(msg.Reject && (msg.MatchIndex != 0 || msg.ConflictTerm > msg.Term || msg.ConflictIndex > msg.PrevLogIndex ||
+				(msg.ConflictTerm != 0 && msg.ConflictIndex == 0))) ||
+			(!msg.Reject && (msg.MatchIndex < msg.PrevLogIndex || msg.ConflictTerm != 0 || msg.ConflictIndex != 0)) {
+			return errors.New("invalid AppendEntries response fields")
+		}
+		if msg.Term == c.hardState.Term && c.role == Leader &&
+			(msg.PrevLogIndex > c.lastLogIndex() || (!msg.Reject && msg.MatchIndex > c.lastLogIndex())) {
+			return errors.New("append response exceeds the leader log")
+		}
 	default:
 		return fmt.Errorf("%w: %s", ErrUnsupportedMessage, msg.Type)
 	}
-	if msg.Type != raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES &&
+	if msg.Type != raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES && msg.Type != raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE &&
 		(msg.PrevLogIndex != 0 || msg.PrevLogTerm != 0 || len(msg.Entries) != 0 ||
 			msg.LeaderCommit != 0 || msg.MatchIndex != 0 || msg.ConflictTerm != 0 || msg.ConflictIndex != 0) {
 		return errors.New("election messages must not carry replication fields")
@@ -230,15 +242,14 @@ func (c *Core) Step(msg *raftv1.Message) error {
 	if msg.Type == raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES {
 		return c.stepAppend(msg)
 	}
-	if msg.Type == raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT {
-		if msg.Term >= c.hardState.Term {
-			c.becomeFollower(msg.Term, msg.From)
-		}
-		// Stale heartbeats are ignored. Heartbeat responses await CheckQuorum.
-		return nil
-	}
 	if msg.Term > c.hardState.Term {
 		c.becomeFollower(msg.Term, 0)
+	}
+	if msg.Type == raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE {
+		if msg.Term == c.hardState.Term && c.role == Leader {
+			c.stepAppendResponse(msg)
+		}
+		return nil
 	}
 	if msg.Type == raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE {
 		upToDate := msg.LastLogTerm > c.lastLogTerm() ||
@@ -263,6 +274,22 @@ func (c *Core) Step(msg *raftv1.Message) error {
 		}
 	}
 	return nil
+}
+
+// Propose appends an owned copy of data on the leader and returns its position.
+// Success means local acceptance, not commitment; observe Ready for commitment.
+// On ErrNotLeader, Status supplies the most recently known LeaderID.
+func (c *Core) Propose(data []byte) (index, term uint64, err error) {
+	if !c.initialized || c.readyPending {
+		return 0, 0, ErrReadyPending
+	}
+	if c.role != Leader {
+		return 0, 0, ErrNotLeader
+	}
+	index = c.appendEntry(raftv1.EntryType_ENTRY_TYPE_NORMAL, data)
+	c.maybeCommit()
+	c.broadcastAppend()
+	return index, c.hardState.Term, nil
 }
 
 func (c *Core) stepAppend(msg *raftv1.Message) error {
@@ -327,6 +354,7 @@ func (c *Core) becomeFollower(term, leaderID uint64) {
 	c.role = Follower
 	c.leaderID = leaderID
 	c.votes = nil
+	c.progress = nil
 	c.heartbeatElapsed = 0
 	c.resetElectionTimer()
 }
@@ -344,21 +372,99 @@ func (c *Core) maybeBecomeLeader() {
 		c.electionElapsed = 0
 		c.heartbeatElapsed = 0
 		c.votes = nil
-		c.broadcastHeartbeat()
+		c.progress = make(map[uint64]*progress)
+		for _, peer := range c.voters {
+			if peer != c.id {
+				c.progress[peer] = &progress{next: c.lastLogIndex() + 1}
+			}
+		}
+		c.appendEntry(raftv1.EntryType_ENTRY_TYPE_NO_OP, nil)
+		c.maybeCommit()
+		c.broadcastAppend()
 	}
 }
 
-func (c *Core) broadcastHeartbeat() {
+func (c *Core) appendEntry(kind raftv1.EntryType, data []byte) uint64 {
+	index := c.lastLogIndex() + 1
+	c.log = append(c.log, &raftv1.Entry{Index: index, Term: c.hardState.Term, Type: kind, Data: slices.Clone(data)})
+	return index
+}
+
+func (c *Core) broadcastAppend() {
 	for _, peer := range c.voters {
 		if peer != c.id {
-			c.messages = append(c.messages, &raftv1.Message{
-				Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT,
-				From: c.id,
-				To:   peer,
-				Term: c.hardState.Term,
-			})
+			c.sendAppend(peer)
 		}
 	}
+}
+
+func (c *Core) sendAppend(peer uint64) {
+	// ponytail: full-suffix retries duplicate bytes; add bounded batches and
+	// pipelining if measured replication throughput needs them.
+	previous := c.progress[peer].next - 1
+	var previousTerm uint64
+	if previous > 0 {
+		previousTerm = c.log[previous-1].Term
+	}
+	c.messages = append(c.messages, &raftv1.Message{
+		Type: raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES,
+		From: c.id, To: peer, Term: c.hardState.Term,
+		PrevLogIndex: previous, PrevLogTerm: previousTerm, LeaderCommit: c.hardState.Commit,
+		// Own the slice before future suffix replacement; log entry objects are immutable.
+		Entries: slices.Clone(c.log[previous:]),
+	})
+}
+
+func (c *Core) stepAppendResponse(msg *raftv1.Message) {
+	p := c.progress[msg.From]
+	if msg.Reject {
+		// Correlate the rejection with the current probe, and never undo a
+		// successful acknowledgment even if an older rejection arrives later.
+		if msg.PrevLogIndex != p.next-1 || msg.PrevLogIndex <= p.match || msg.ConflictIndex == 0 {
+			return
+		}
+		next := msg.ConflictIndex
+		if msg.ConflictTerm != 0 {
+			for i := c.lastLogIndex(); i > 0; i-- {
+				if c.log[i-1].Term == msg.ConflictTerm {
+					next = i + 1
+					break
+				}
+			}
+		}
+		p.next = max(p.match+1, min(next, p.next-1))
+		c.sendAppend(msg.From)
+		return
+	}
+	if msg.MatchIndex <= p.match {
+		return
+	}
+	p.match = msg.MatchIndex
+	p.next = max(p.next, p.match+1)
+	if c.maybeCommit() {
+		c.broadcastAppend()
+	} else if p.next <= c.lastLogIndex() {
+		c.sendAppend(msg.From)
+	}
+}
+
+func (c *Core) maybeCommit() bool {
+	matched := make([]uint64, 0, len(c.voters))
+	for _, peer := range c.voters {
+		if peer == c.id {
+			matched = append(matched, c.lastLogIndex())
+		} else {
+			matched = append(matched, c.progress[peer].match)
+		}
+	}
+	slices.Sort(matched)
+	// The largest index held by a strict majority, including even-sized groups.
+	index := matched[(len(matched)-1)/2]
+	if index > c.hardState.Commit && c.log[index-1].Term == c.hardState.Term {
+		c.hardState.Commit = index
+		return true
+	}
+	return false
 }
 
 // Ready emits state changes, changed log suffixes, messages and committed entries.

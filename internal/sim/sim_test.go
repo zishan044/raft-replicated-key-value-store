@@ -43,8 +43,9 @@ func block(t *testing.T, s *Simulator, from, to uint64, blocked bool) {
 
 // Inject only into the private network for focused transport tests. Public
 // simulation inputs are ticks and fault controls, never arbitrary Raft messages.
-func heartbeat(from, to, term uint64) *raftv1.Message {
-	return &raftv1.Message{Type: raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT, From: from, To: to, Term: term}
+// Vote rejections advance terms without return traffic, isolating queue behavior.
+func termMessage(from, to, term uint64) *raftv1.Message {
+	return &raftv1.Message{Type: raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE, From: from, To: to, Term: term, Reject: true}
 }
 
 func TestConfigurationAndControlValidation(t *testing.T) {
@@ -154,8 +155,8 @@ func TestReliableClockOrderingAndMemory(t *testing.T) {
 	}
 	// Same deadline: preserve send order unless explicit reordering is enabled.
 	s = newSim(t, 0)
-	s.enqueue(heartbeat(1, 2, 1))
-	s.enqueue(heartbeat(1, 2, 2))
+	s.enqueue(termMessage(1, 2, 1))
+	s.enqueue(termMessage(1, 2, 2))
 	run(t, s, 1)
 	trace := s.Trace()
 	first, second := strings.Index(trace, "deliver id=1 "), strings.Index(trace, "deliver id=2 ")
@@ -273,9 +274,8 @@ func TestFollowerAppendRetainedBeforeReplyAndApply(t *testing.T) {
 	if retained < 0 || state <= retained || reply <= state || firstApply <= reply || secondApply <= firstApply {
 		t.Fatalf("append did not retain, reply, then apply in order:\n%s", trace)
 	}
-	// Drop the reply: leader response handling belongs to subset 3. Deliver a
-	// delayed shorter request and ensure it cannot delete the newer no-op tail.
-	s.queue = nil
+	// Deliver a delayed shorter request and ensure it preserves the newer
+	// no-op tail, even while the previous acknowledgment is also in flight.
 	start = len(s.trace)
 	delayed := proto.Clone(request).(*raftv1.Message)
 	delayed.Entries, delayed.LeaderCommit = delayed.Entries[:1], 2
@@ -294,12 +294,12 @@ func TestFollowerAppendRetainedBeforeReplyAndApply(t *testing.T) {
 func TestDropAndDuplication(t *testing.T) {
 	s := newSim(t, 0)
 	faults(t, s, Faults{DropPercent: 100})
-	s.enqueue(heartbeat(1, 2, 1))
+	s.enqueue(termMessage(1, 2, 1))
 	if len(s.queue) != 0 || !strings.Contains(s.Trace(), "drop random") {
 		t.Fatal("100% loss did not drop the message")
 	}
 	faults(t, s, Faults{DuplicatePercent: 100})
-	s.enqueue(heartbeat(1, 2, 1))
+	s.enqueue(termMessage(1, 2, 1))
 	if len(s.queue) != 2 || s.queue[0].sequence == s.queue[1].sequence {
 		t.Fatal("duplication did not create two independently scheduled deliveries")
 	}
@@ -309,7 +309,7 @@ func TestDropAndDuplication(t *testing.T) {
 	}
 	faults(t, s, Faults{DuplicatePercent: 100, MinDelay: 2, MaxDelay: 5})
 	for range 8 {
-		s.enqueue(heartbeat(1, 2, 2))
+		s.enqueue(termMessage(1, 2, 2))
 	}
 	different := false
 	for i, event := range s.queue {
@@ -328,7 +328,7 @@ func TestDropAndDuplication(t *testing.T) {
 func TestDelayAndReordering(t *testing.T) {
 	s := newSim(t, 0)
 	faults(t, s, Faults{MinDelay: 3, MaxDelay: 3})
-	s.enqueue(heartbeat(1, 2, 1))
+	s.enqueue(termMessage(1, 2, 1))
 	run(t, s, 2)
 	if s.stored[2].Term != 0 || len(s.queue) != 1 {
 		t.Fatal("delayed traffic arrived early")
@@ -340,9 +340,9 @@ func TestDelayAndReordering(t *testing.T) {
 	// A later send with a shorter delay must overtake the first message.
 	s = newSim(t, 0)
 	faults(t, s, Faults{MinDelay: 3, MaxDelay: 3})
-	s.enqueue(heartbeat(1, 2, 1))
+	s.enqueue(termMessage(1, 2, 1))
 	faults(t, s, Faults{})
-	s.enqueue(heartbeat(1, 2, 2))
+	s.enqueue(termMessage(1, 2, 2))
 	run(t, s, 3)
 	trace := s.Trace()
 	if strings.Index(trace, "deliver id=2 ") >= strings.Index(trace, "deliver id=1 ") || s.stored[2].Term != 2 {
@@ -352,7 +352,7 @@ func TestDelayAndReordering(t *testing.T) {
 	s = newSim(t, 0)
 	faults(t, s, Faults{Reorder: true})
 	for term := uint64(1); term <= 8; term++ {
-		s.enqueue(heartbeat(1, 2, term))
+		s.enqueue(termMessage(1, 2, term))
 	}
 	run(t, s, 1)
 	last := -1
@@ -376,19 +376,19 @@ func TestDelayAndReordering(t *testing.T) {
 func TestDirectedPartitionsAndHealing(t *testing.T) {
 	s := newSim(t, 0)
 	block(t, s, 1, 2, true)
-	s.enqueue(heartbeat(1, 2, 1))
-	s.enqueue(heartbeat(2, 1, 1))
+	s.enqueue(termMessage(1, 2, 1))
+	s.enqueue(termMessage(2, 1, 1))
 	run(t, s, 1)
 	if s.stored[1].Term != 1 || s.stored[2].Term != 0 {
 		t.Fatal("directed partition blocked the wrong direction")
 	}
 	block(t, s, 2, 1, true)
-	s.enqueue(heartbeat(2, 1, 2))
+	s.enqueue(termMessage(2, 1, 2))
 	if len(s.queue) != 0 {
 		t.Fatal("symmetric partition allowed reverse traffic")
 	}
 	block(t, s, 1, 2, false)
-	s.enqueue(heartbeat(1, 2, 2))
+	s.enqueue(termMessage(1, 2, 2))
 	block(t, s, 1, 2, true)
 	run(t, s, 1)
 	if s.stored[2].Term != 0 || !strings.Contains(s.Trace(), "drop partition delivery=") {
@@ -396,8 +396,8 @@ func TestDirectedPartitionsAndHealing(t *testing.T) {
 	}
 	s.Heal()
 	faults(t, s, Faults{MinDelay: 100, MaxDelay: 100})
-	s.enqueue(heartbeat(1, 2, 3))
-	s.enqueue(heartbeat(2, 1, 4))
+	s.enqueue(termMessage(1, 2, 3))
+	s.enqueue(termMessage(2, 1, 4))
 	faults(t, s, Faults{DropPercent: 100, DuplicatePercent: 100, Reorder: true})
 	block(t, s, 1, 2, true)
 	serial := s.serial
@@ -406,7 +406,7 @@ func TestDirectedPartitionsAndHealing(t *testing.T) {
 	if s.stored[1].Term != 4 || s.stored[2].Term != 3 || len(s.queue) != 0 || s.serial != serial {
 		t.Fatal("healing discarded, duplicated, or failed to drain old traffic in one tick")
 	}
-	s.enqueue(heartbeat(1, 2, 5))
+	s.enqueue(termMessage(1, 2, 5))
 	if len(s.queue) != 1 || s.queue[0].at != s.Now()+1 {
 		t.Fatal("healing did not restore reliable one-tick delivery")
 	}
