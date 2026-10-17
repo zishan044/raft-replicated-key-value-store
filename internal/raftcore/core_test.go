@@ -169,7 +169,6 @@ func TestStepBoundary(t *testing.T) {
 	for _, msgType := range []raftv1.MessageType{
 		raftv1.MessageType_MESSAGE_TYPE_PRE_VOTE,
 		raftv1.MessageType_MESSAGE_TYPE_PRE_VOTE_RESPONSE,
-		raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES,
 		raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE,
 		raftv1.MessageType_MESSAGE_TYPE_UNSPECIFIED,
 		999,

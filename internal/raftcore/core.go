@@ -1,7 +1,7 @@
 // Package raftcore implements the single-threaded Raft state machine. Callers
 // supply logical ticks and messages; the core performs no I/O and reads no clock.
-// It currently implements elections, an in-memory log and leader heartbeats;
-// replication message handling is introduced separately.
+// It currently implements elections, an in-memory log, leader heartbeats and
+// follower AppendEntries; leader replication is introduced separately.
 package raftcore
 
 import (
@@ -124,19 +124,8 @@ func New(cfg Config) (*Core, error) {
 	if cfg.HardState.Vote != 0 && (cfg.HardState.Term == 0 || !slices.Contains(voters, cfg.HardState.Vote)) {
 		return nil, errors.New("initial vote must name a voter in a positive term")
 	}
-	var previousTerm uint64
-	for i, entry := range cfg.Entries {
-		if entry == nil || entry.Index != uint64(i)+1 || entry.Term == 0 ||
-			entry.Term < previousTerm || entry.Term > cfg.HardState.Term {
-			return nil, errors.New("initial log must have contiguous indices from 1 and positive, nondecreasing terms no greater than current term")
-		}
-		if entry.Type != raftv1.EntryType_ENTRY_TYPE_NORMAL && entry.Type != raftv1.EntryType_ENTRY_TYPE_NO_OP {
-			return nil, errors.New("initial log contains an unsupported entry type")
-		}
-		if entry.Type == raftv1.EntryType_ENTRY_TYPE_NO_OP && len(entry.Data) != 0 {
-			return nil, errors.New("no-op entries must not carry data")
-		}
-		previousTerm = entry.Term
+	if err := validateEntries(cfg.Entries, 0, 0, cfg.HardState.Term); err != nil {
+		return nil, err
 	}
 	if cfg.HardState.Commit > uint64(len(cfg.Entries)) {
 		return nil, errors.New("initial commit index exceeds the last log index")
@@ -198,8 +187,9 @@ func (c *Core) Tick() error {
 	return nil
 }
 
-// Step handles RequestVote, its response, and heartbeats without retaining input.
-// Unsupported or malformed messages never change term, vote, or election time.
+// Step handles votes, heartbeats and follower AppendEntries, copying retained
+// entries. Unsupported, malformed or committed-conflicting messages leave the
+// core unchanged. Stale appends and log-prefix mismatches produce rejections.
 func (c *Core) Step(msg *raftv1.Message) error {
 	if !c.initialized || c.readyPending {
 		return ErrReadyPending
@@ -217,15 +207,28 @@ func (c *Core) Step(msg *raftv1.Message) error {
 		if msg.Reject || msg.LastLogIndex != 0 || msg.LastLogTerm != 0 {
 			return errors.New("heartbeats must not carry vote results or log metadata")
 		}
+	case raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES:
+		if msg.Reject || msg.LastLogIndex != 0 || msg.LastLogTerm != 0 || msg.MatchIndex != 0 ||
+			msg.ConflictTerm != 0 || msg.ConflictIndex != 0 ||
+			(msg.PrevLogIndex == 0) != (msg.PrevLogTerm == 0) || msg.PrevLogTerm > msg.Term {
+			return errors.New("invalid AppendEntries metadata or response fields")
+		}
+		if err := validateEntries(msg.Entries, msg.PrevLogIndex, msg.PrevLogTerm, msg.Term); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("%w: %s", ErrUnsupportedMessage, msg.Type)
 	}
-	if msg.PrevLogIndex != 0 || msg.PrevLogTerm != 0 || len(msg.Entries) != 0 ||
-		msg.LeaderCommit != 0 || msg.MatchIndex != 0 || msg.ConflictTerm != 0 || msg.ConflictIndex != 0 {
+	if msg.Type != raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES &&
+		(msg.PrevLogIndex != 0 || msg.PrevLogTerm != 0 || len(msg.Entries) != 0 ||
+			msg.LeaderCommit != 0 || msg.MatchIndex != 0 || msg.ConflictTerm != 0 || msg.ConflictIndex != 0) {
 		return errors.New("election messages must not carry replication fields")
 	}
 	if msg.Term == 0 {
-		return errors.New("election messages require a positive term")
+		return errors.New("messages require a positive term")
+	}
+	if msg.Type == raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES {
+		return c.stepAppend(msg)
 	}
 	if msg.Type == raftv1.MessageType_MESSAGE_TYPE_HEARTBEAT {
 		if msg.Term >= c.hardState.Term {
@@ -259,6 +262,55 @@ func (c *Core) Step(msg *raftv1.Message) error {
 			c.maybeBecomeLeader()
 		}
 	}
+	return nil
+}
+
+func (c *Core) stepAppend(msg *raftv1.Message) error {
+	response := &raftv1.Message{
+		Type: raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE,
+		From: c.id, To: msg.From, Term: c.hardState.Term,
+		PrevLogIndex: msg.PrevLogIndex, Reject: true,
+	}
+	if msg.Term < c.hardState.Term {
+		c.messages = append(c.messages, response)
+		return nil
+	}
+	appendFrom := len(msg.Entries)
+	switch {
+	case msg.PrevLogIndex > c.lastLogIndex():
+		response.ConflictIndex = c.lastLogIndex() + 1
+	case msg.PrevLogIndex > 0 && c.log[msg.PrevLogIndex-1].Term != msg.PrevLogTerm:
+		response.ConflictTerm = c.log[msg.PrevLogIndex-1].Term
+		response.ConflictIndex = msg.PrevLogIndex
+		for response.ConflictIndex > 1 && c.log[response.ConflictIndex-2].Term == response.ConflictTerm {
+			response.ConflictIndex--
+		}
+	default:
+		response.Reject = false
+		response.MatchIndex = msg.PrevLogIndex + uint64(len(msg.Entries))
+		for i, entry := range msg.Entries {
+			if entry.Index > c.lastLogIndex() || c.log[entry.Index-1].Term != entry.Term {
+				if entry.Index <= c.hardState.Commit {
+					return fmt.Errorf("append conflicts with committed entry at index %d", entry.Index)
+				}
+				appendFrom = i
+				break
+			}
+		}
+	}
+	// All error-producing validation precedes mutation. Even a prefix mismatch
+	// proves leader contact in this term and resets the election timeout.
+	c.becomeFollower(msg.Term, msg.From)
+	response.Term = c.hardState.Term
+	if !response.Reject {
+		if appendFrom < len(msg.Entries) {
+			first := msg.Entries[appendFrom].Index
+			c.log = append(c.log[:first-1], cloneEntries(msg.Entries[appendFrom:])...)
+			c.unstableFrom = min(c.unstableFrom, first)
+		}
+		c.hardState.Commit = max(c.hardState.Commit, min(msg.LeaderCommit, response.MatchIndex))
+	}
+	c.messages = append(c.messages, response)
 	return nil
 }
 
@@ -365,6 +417,28 @@ func (c *Core) lastLogTerm() uint64 {
 		return 0
 	}
 	return c.log[len(c.log)-1].Term
+}
+
+// validateEntries is shared by initial logs and incoming append batches. The
+// preceding position anchors both index continuity and nondecreasing terms.
+func validateEntries(entries []*raftv1.Entry, prevIndex, prevTerm, term uint64) error {
+	if uint64(len(entries)) > ^uint64(0)-prevIndex {
+		return errors.New("entry indices overflow uint64")
+	}
+	for i, entry := range entries {
+		if entry == nil || entry.Index != prevIndex+uint64(i)+1 || entry.Term == 0 ||
+			entry.Term < prevTerm || entry.Term > term {
+			return errors.New("entries must have contiguous indices and positive, nondecreasing terms no greater than current term")
+		}
+		if entry.Type != raftv1.EntryType_ENTRY_TYPE_NORMAL && entry.Type != raftv1.EntryType_ENTRY_TYPE_NO_OP {
+			return errors.New("unsupported entry type")
+		}
+		if entry.Type == raftv1.EntryType_ENTRY_TYPE_NO_OP && len(entry.Data) != 0 {
+			return errors.New("no-op entries must not carry data")
+		}
+		prevTerm = entry.Term
+	}
+	return nil
 }
 
 func cloneEntries(entries []*raftv1.Entry) []*raftv1.Entry {

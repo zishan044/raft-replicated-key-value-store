@@ -224,6 +224,73 @@ func TestInitialLogBatchRetainedAndApplied(t *testing.T) {
 	}
 }
 
+func TestFollowerAppendRetainedBeforeReplyAndApply(t *testing.T) {
+	s := newSim(t, 42)
+	core, err := raftcore.New(raftcore.Config{
+		ID: 2, Voters: s.voters, Seed: 42, ElectionTicks: 10, HeartbeatTicks: 2,
+		HardState: raftcore.HardState{Term: 3, Vote: 1, Commit: 1},
+		Entries: []*raftv1.Entry{
+			{Index: 1, Term: 1, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL, Data: []byte("prefix")},
+			{Index: 2, Term: 2, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL, Data: []byte("old")},
+			{Index: 3, Term: 2, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL},
+			{Index: 4, Term: 3, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.nodes[2] = core
+	if err := s.finish(core, core.Status()); err != nil {
+		t.Fatal(err)
+	}
+	prefix := s.storedEntries[2][0]
+	start := len(s.trace)
+	request := &raftv1.Message{
+		Type: raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES, From: 1, To: 2, Term: 4,
+		PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 3,
+		Entries: []*raftv1.Entry{
+			{Index: 2, Term: 4, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL, Data: []byte("new")},
+			{Index: 3, Term: 4, Type: raftv1.EntryType_ENTRY_TYPE_NO_OP},
+		},
+	}
+	s.enqueue(request)
+	run(t, s, 1)
+	if len(s.storedEntries[2]) != 3 || s.storedEntries[2][0] != prefix ||
+		!proto.Equal(s.storedEntries[2][1], request.Entries[0]) || len(s.appliedEntries[2]) != 3 ||
+		s.stored[2] != (raftcore.HardState{Term: 4, Commit: 3}) || core.Status().AppliedIndex != 3 {
+		t.Fatal("append failed to retain the changed suffix and apply the committed prefix")
+	}
+	if len(s.queue) != 1 || s.queue[0].message.Reject || s.queue[0].message.MatchIndex != 3 ||
+		s.queue[0].message.PrevLogIndex != 1 {
+		t.Fatal("append did not enqueue the expected acknowledgment")
+	}
+	trace := strings.Join(s.trace[start:], "\n")
+	retained := strings.Index(trace, "save_entries node=2 first=2 count=2")
+	state := strings.Index(trace, "save node=2 term=4 vote=0 commit=3")
+	reply := strings.Index(trace, "MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE from=2 to=1 term=4")
+	firstApply := strings.Index(trace, "apply node=2 index=2 ")
+	secondApply := strings.Index(trace, "apply node=2 index=3 ")
+	if retained < 0 || state <= retained || reply <= state || firstApply <= reply || secondApply <= firstApply {
+		t.Fatalf("append did not retain, reply, then apply in order:\n%s", trace)
+	}
+	// Drop the reply: leader response handling belongs to subset 3. Deliver a
+	// delayed shorter request and ensure it cannot delete the newer no-op tail.
+	s.queue = nil
+	start = len(s.trace)
+	delayed := proto.Clone(request).(*raftv1.Message)
+	delayed.Entries, delayed.LeaderCommit = delayed.Entries[:1], 2
+	s.enqueue(delayed)
+	run(t, s, 1)
+	if len(s.storedEntries[2]) != 3 || len(s.appliedEntries[2]) != 3 || core.Status().HardState.Commit != 3 ||
+		len(s.queue) != 1 || s.queue[0].message.MatchIndex != 2 {
+		t.Fatal("delayed append changed the committed tail or acknowledged the local last index")
+	}
+	trace = strings.Join(s.trace[start:], "\n")
+	if strings.Contains(trace, "save_entries node=2 ") || strings.Contains(trace, "apply node=2 ") {
+		t.Fatal("delayed append repeated retention or application")
+	}
+}
+
 func TestDropAndDuplication(t *testing.T) {
 	s := newSim(t, 0)
 	faults(t, s, Faults{DropPercent: 100})
