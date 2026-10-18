@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/zishan044/raft-replicated-key-value-store.git/internal/raftcore"
+	"github.com/zishan044/raft-replicated-key-value-store.git/internal/raftio"
 	raftv1 "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -163,6 +164,38 @@ func TestReliableClockOrderingAndMemory(t *testing.T) {
 	first, second := strings.Index(trace, "deliver id=1 "), strings.Index(trace, "deliver id=2 ")
 	if first < 0 || second <= first || s.stored[2].Term != 2 {
 		t.Fatal("equal-time delivery did not preserve insertion order")
+	}
+}
+
+func TestPersistenceFailureStopsReadyProcessing(t *testing.T) {
+	for _, kind := range []raftv1.MessageType{raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE, raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES} {
+		t.Run(kind.String(), func(t *testing.T) {
+			s := newSim(t, 42)
+			failure := errors.New("simulated save failure")
+			core := s.nodes[1]
+			processor, err := raftio.New(core, func(*raftv1.WALBatch) error { return failure },
+				func([]*raftv1.Message) { t.Fatal("sent after a failed save") },
+				func(*raftv1.Entry) error { t.Fatal("applied after a failed save"); return nil },
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.processors[core] = processor
+			msg := &raftv1.Message{Type: kind, From: 2, To: 1, Term: 5}
+			if kind == raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES {
+				msg.Entries = []*raftv1.Entry{{Index: 1, Term: 5, Type: raftv1.EntryType_ENTRY_TYPE_NORMAL, Data: []byte("A")}}
+				msg.LeaderCommit = 1
+			}
+			s.enqueue(msg)
+			err = s.Tick()
+			if !errors.Is(err, failure) || s.stored[1] != (raftcore.HardState{}) || len(s.appliedEntries[1]) != 0 || len(s.queue) != 0 {
+				t.Fatalf("failed save escaped processing: %v", err)
+			}
+			trace, now := s.Trace(), s.Now()
+			if s.Tick() != err || s.Trace() != trace || s.Now() != now || !errors.Is(core.Tick(), raftcore.ErrReadyPending) {
+				t.Fatal("simulation continued after persistence failure")
+			}
+		})
 	}
 }
 

@@ -37,13 +37,27 @@ The WAL directory must already exist, its creation must be durable, and it must
 be exclusively owned and contain only segments. `Open` does not create or lock
 it. Failed writes or syncs disable further saves until close and recovery; a
 failed save may survive as a complete batch, so its outcome is uncertain.
-`OpenFS` accepts the file-operations boundary for disk fault testing. The node
-and simulator still use memory; integration starts in subset 3.
+`OpenFS` accepts the file-operations boundary for disk fault testing.
+
+M3 subset 3 adds `internal/raftio`, a synchronous processor shared by the
+simulator and real-file integration tests. After each core input, it processes
+`Ready` in this order: durably save changed hard state and entries, release
+messages, apply committed entries (including no-op positions), then `Advance`.
+Empty and messages-only batches skip persistence. A save or apply failure is
+terminal: the processor will not retry or advance the batch, and the pending
+`Ready` prevents the core from accepting further input.
+
+`raftio.Restore` builds a fresh follower from recovered storage, replays its
+committed prefix into an empty application, and consumes the initial batch
+without rewriting the WAL. Uncommitted entries remain in the log for later
+replication. Partial application must be discarded before restarting. The
+simulator still retains data in memory; simulated disk faults and node lifecycle
+controls arrive in subset 4. `kvd` still serves only its HTTP skeleton.
 
 Run the focused checks and decoder fuzzing with:
 
 ```bash
-go test -race ./internal/wal
+go test -race ./internal/wal ./internal/raftio
 go test ./internal/wal -run '^$' -fuzz '^FuzzReplay$' -fuzztime=30s
 ```
 

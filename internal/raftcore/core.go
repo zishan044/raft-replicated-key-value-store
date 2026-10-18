@@ -32,8 +32,8 @@ type progress struct {
 	next, match uint64
 }
 
-// HardState is retained with log entries before releasing dependent messages.
-// Consumers currently retain it in memory; this does not provide crash durability.
+// HardState must be durably retained with log entries before releasing dependent
+// messages. The core performs no persistence itself.
 type HardState struct {
 	Term   uint64
 	Vote   uint64 // zero means no vote in this term

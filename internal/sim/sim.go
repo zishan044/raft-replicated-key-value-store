@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/zishan044/raft-replicated-key-value-store.git/internal/raftcore"
+	"github.com/zishan044/raft-replicated-key-value-store.git/internal/raftio"
 	raftv1 "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -48,6 +49,7 @@ type Simulator struct {
 	now            int
 	voters         []uint64
 	nodes          map[uint64]*raftcore.Core
+	processors     map[*raftcore.Core]*raftio.Processor
 	stored         map[uint64]raftcore.HardState
 	storedEntries  map[uint64][]*raftv1.Entry
 	appliedEntries map[uint64][]*raftv1.Entry
@@ -86,6 +88,7 @@ func New(cfg Config) (*Simulator, error) {
 	s := &Simulator{
 		seed: cfg.Seed, voters: cfg.Voters,
 		nodes: make(map[uint64]*raftcore.Core), stored: make(map[uint64]raftcore.HardState),
+		processors:    make(map[*raftcore.Core]*raftio.Processor),
 		storedEntries: make(map[uint64][]*raftv1.Entry), appliedEntries: make(map[uint64][]*raftv1.Entry),
 		leaders: make(map[uint64]uint64), blocked: make(map[link]bool),
 		leaderLogs: make(map[uint64][]*raftv1.Entry), observed: make(map[uint64]nodeView),
@@ -303,49 +306,70 @@ func (s *Simulator) finish(core *raftcore.Core, before raftcore.Status) error {
 	if err := s.checkLogs(nodeView{status: status, entries: entries}, changed); err != nil {
 		return err
 	}
-	if len(rd.Entries) > 0 {
-		first := rd.Entries[0].Index
-		stored := s.storedEntries[status.ID]
+	processor := s.processors[core]
+	if processor == nil {
+		var err error
+		processor, err = raftio.New(core,
+			func(batch *raftv1.WALBatch) error { return s.save(status.ID, batch) },
+			func(messages []*raftv1.Message) {
+				for _, msg := range messages {
+					s.enqueue(msg)
+				}
+			},
+			func(entry *raftv1.Entry) error { return s.apply(status.ID, entry) },
+		)
+		if err != nil {
+			return err
+		}
+		s.processors[core] = processor
+	}
+	// ponytail: inspect a second Ready snapshot to keep the processor independent;
+	// share one batch if profiling shows snapshot copies dominate simulation.
+	if err := processor.Process(); err != nil {
+		return err
+	}
+	view := s.observed[status.ID]
+	view.status = core.Status()
+	s.observed[status.ID] = view
+	return nil
+}
+
+func (s *Simulator) save(id uint64, batch *raftv1.WALBatch) error {
+	if len(batch.Entries) > 0 {
+		first := batch.Entries[0].Index
+		stored := s.storedEntries[id]
 		if first == 0 || first > uint64(len(stored))+1 {
-			return fmt.Errorf("node %d: retained log has a gap before index %d", status.ID, first)
+			return fmt.Errorf("node %d: retained log has a gap before index %d", id, first)
 		}
-		// Ready transfers ownership of these entry copies to the consumer.
-		s.storedEntries[status.ID] = append(stored[:first-1], rd.Entries...)
-		s.log("save_entries node=%d first=%d count=%d", status.ID, first, len(rd.Entries))
-		for _, entry := range rd.Entries {
-			s.log("save_entry node=%d index=%d term=%d type=%s data=%x", status.ID, entry.Index, entry.Term, entry.Type, entry.Data)
+		// Save takes ownership of the immutable batch entries.
+		s.storedEntries[id] = append(stored[:first-1], batch.Entries...)
+		s.log("save_entries node=%d first=%d count=%d", id, first, len(batch.Entries))
+		for _, entry := range batch.Entries {
+			s.log("save_entry node=%d index=%d term=%d type=%s data=%x", id, entry.Index, entry.Term, entry.Type, entry.Data)
 		}
 	}
-	if rd.HardState != nil {
-		s.stored[status.ID] = *rd.HardState
-		s.log("save node=%d term=%d vote=%d commit=%d", status.ID, rd.HardState.Term, rd.HardState.Vote, rd.HardState.Commit)
-	}
-	if status.HardState.Commit != before.HardState.Commit {
-		s.log("commit node=%d index=%d", status.ID, status.HardState.Commit)
-	}
-	for _, msg := range rd.Messages {
-		s.enqueue(msg)
-	}
-	for _, entry := range rd.CommittedEntries {
-		stored := s.storedEntries[status.ID]
-		if entry.Index != uint64(len(s.appliedEntries[status.ID]))+1 || entry.Index > s.stored[status.ID].Commit ||
-			entry.Index > uint64(len(stored)) || !proto.Equal(entry, stored[entry.Index-1]) {
-			return fmt.Errorf("node %d: application at index %d is out of order or not retained and committed", status.ID, entry.Index)
+	if hs := batch.HardState; hs != nil {
+		old := s.stored[id]
+		s.stored[id] = raftcore.HardState{Term: hs.Term, Vote: hs.Vote, Commit: hs.Commit}
+		s.log("save node=%d term=%d vote=%d commit=%d", id, hs.Term, hs.Vote, hs.Commit)
+		if hs.Commit != old.Commit {
+			s.log("commit node=%d index=%d", id, hs.Commit)
 		}
-		if err := s.checkApplied(status.ID, entry); err != nil {
-			return err
-		}
-		s.appliedEntries[status.ID] = append(s.appliedEntries[status.ID], entry)
-		s.log("apply node=%d index=%d term=%d type=%s data=%x", status.ID, entry.Index, entry.Term, entry.Type, entry.Data)
 	}
-	if rd.HardState != nil || len(rd.Entries) > 0 || len(rd.Messages) > 0 || len(rd.CommittedEntries) > 0 {
-		if err := core.Advance(); err != nil {
-			return err
-		}
-		view := s.observed[status.ID]
-		view.status = core.Status()
-		s.observed[status.ID] = view
+	return nil
+}
+
+func (s *Simulator) apply(id uint64, entry *raftv1.Entry) error {
+	stored := s.storedEntries[id]
+	if entry.Index != uint64(len(s.appliedEntries[id]))+1 || entry.Index > s.stored[id].Commit ||
+		entry.Index > uint64(len(stored)) || !proto.Equal(entry, stored[entry.Index-1]) {
+		return fmt.Errorf("node %d: application at index %d is out of order or not retained and committed", id, entry.Index)
 	}
+	if err := s.checkApplied(id, entry); err != nil {
+		return err
+	}
+	s.appliedEntries[id] = append(s.appliedEntries[id], entry)
+	s.log("apply node=%d index=%d term=%d type=%s data=%x", id, entry.Index, entry.Term, entry.Type, entry.Data)
 	return nil
 }
 
