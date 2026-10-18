@@ -12,6 +12,7 @@ import (
 
 	"github.com/zishan044/raft-replicated-key-value-store.git/internal/raftcore"
 	"github.com/zishan044/raft-replicated-key-value-store.git/internal/raftio"
+	"github.com/zishan044/raft-replicated-key-value-store.git/internal/wal"
 	raftv1 "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -42,14 +43,18 @@ type delivery struct {
 	message  *raftv1.Message // immutable, including across duplicate deliveries
 }
 
-// Simulator must be owned by one goroutine. A failed Tick is terminal; later
-// Tick/Run calls return the original failure with its seed and logical time.
+// Simulator must be owned by one goroutine. Invariant and unexpected failures
+// are terminal. Injected disk failures stop only the affected node.
 type Simulator struct {
+	config         Config
 	seed           uint64
 	now            int
 	voters         []uint64
 	nodes          map[uint64]*raftcore.Core
 	processors     map[*raftcore.Core]*raftio.Processor
+	disks          map[uint64]*Disk
+	wals           map[uint64]*wal.WAL
+	incarnations   map[uint64]uint64
 	stored         map[uint64]raftcore.HardState
 	storedEntries  map[uint64][]*raftv1.Entry
 	appliedEntries map[uint64][]*raftv1.Entry
@@ -86,9 +91,10 @@ func New(cfg Config) (*Simulator, error) {
 		cfg.HeartbeatTicks = 2
 	}
 	s := &Simulator{
-		seed: cfg.Seed, voters: cfg.Voters,
+		config: cfg, seed: cfg.Seed, voters: cfg.Voters,
 		nodes: make(map[uint64]*raftcore.Core), stored: make(map[uint64]raftcore.HardState),
-		processors:    make(map[*raftcore.Core]*raftio.Processor),
+		processors: make(map[*raftcore.Core]*raftio.Processor),
+		disks:      make(map[uint64]*Disk), wals: make(map[uint64]*wal.WAL), incarnations: make(map[uint64]uint64),
 		storedEntries: make(map[uint64][]*raftv1.Entry), appliedEntries: make(map[uint64][]*raftv1.Entry),
 		leaders: make(map[uint64]uint64), blocked: make(map[link]bool),
 		leaderLogs: make(map[uint64][]*raftv1.Entry), observed: make(map[uint64]nodeView),
@@ -96,17 +102,20 @@ func New(cfg Config) (*Simulator, error) {
 	}
 	s.log("config %+v", cfg)
 	for _, id := range s.voters {
-		// Node IDs are positive, so these streams are distinct from the network's.
-		seed := rand.NewPCG(cfg.Seed, id).Uint64()
-		core, err := raftcore.New(raftcore.Config{
-			ID: id, Voters: s.voters, Seed: seed,
-			ElectionTicks: cfg.ElectionTicks, HeartbeatTicks: cfg.HeartbeatTicks,
-		})
+		nodeCfg := s.nodeConfig(id, 0)
+		core, err := raftcore.New(nodeCfg)
 		if err != nil {
 			return nil, err
 		}
+		disk := NewDisk()
+		disk.trace = func(event string) { s.log("disk node=%d %s", id, event) }
+		writer, _, err := wal.OpenFS(disk, ".")
+		if err != nil {
+			return nil, err
+		}
+		s.disks[id], s.wals[id] = disk, writer
 		s.nodes[id] = core
-		s.log("node id=%d seed=%d timeout=%d", id, seed, core.Status().ElectionTimeout)
+		s.log("node id=%d seed=%d timeout=%d", id, nodeCfg.Seed, core.Status().ElectionTimeout)
 		if err := s.finish(core, core.Status()); err != nil {
 			return nil, err
 		}
@@ -132,7 +141,7 @@ func (s *Simulator) SetFaults(f Faults) error {
 // partition, or multiple links to isolate a node/group. Unblocking never revives
 // messages already dropped, but leaves other in-flight messages intact.
 func (s *Simulator) SetBlocked(from, to uint64, blocked bool) error {
-	if from == to || s.nodes[from] == nil || s.nodes[to] == nil {
+	if from == to || !slices.Contains(s.voters, from) || !slices.Contains(s.voters, to) {
 		return errors.New("partition link must connect two distinct voters")
 	}
 	if blocked {
@@ -166,11 +175,17 @@ func (s *Simulator) Tick() error {
 	s.log("tick")
 	for _, id := range s.voters {
 		core := s.nodes[id]
+		if core == nil {
+			continue
+		}
 		before := core.Status()
 		if err := core.Tick(); err != nil {
 			return s.fail(err)
 		}
 		if err := s.finish(core, before); err != nil {
+			if errors.Is(err, ErrDiskFault) {
+				continue
+			}
 			return s.fail(err)
 		}
 	}
@@ -198,6 +213,10 @@ func (s *Simulator) Tick() error {
 	}
 	for _, event := range due {
 		msg := event.message
+		if s.nodes[msg.To] == nil {
+			s.log("drop down delivery=%d node=%d", event.sequence, msg.To)
+			continue
+		}
 		if s.blocked[link{msg.From, msg.To}] {
 			s.log("drop partition delivery=%d", event.sequence)
 			continue
@@ -209,6 +228,9 @@ func (s *Simulator) Tick() error {
 			return s.fail(err)
 		}
 		if err := s.finish(core, before); err != nil {
+			if errors.Is(err, ErrDiskFault) {
+				continue
+			}
 			return s.fail(err)
 		}
 	}
@@ -232,13 +254,18 @@ func (s *Simulator) Run(ticks int) error {
 
 // Propose delivers an opaque command to one node and processes its Ready batch.
 // ErrNotLeader is a normal rejection. Acceptance returns a local log position;
-// inspect AppliedEntries to establish application. Other core failures are terminal.
+// inspect AppliedEntries to establish application. A disk fault returns the
+// accepted index/term with ErrDiskFault: its persistence outcome is uncertain.
+// Other core failures are terminal.
 func (s *Simulator) Propose(id uint64, data []byte) (index, term uint64, err error) {
 	if s.err != nil {
 		return 0, 0, s.err
 	}
 	core := s.nodes[id]
 	if core == nil {
+		if s.disks[id] != nil {
+			return 0, 0, ErrNodeDown
+		}
 		return 0, 0, errors.New("proposal must target a voter")
 	}
 	before := core.Status()
@@ -253,6 +280,9 @@ func (s *Simulator) Propose(id uint64, data []byte) (index, term uint64, err err
 	}
 	s.log("proposal_accepted node=%d index=%d term=%d", id, index, term)
 	if err := s.finish(core, before); err != nil {
+		if errors.Is(err, ErrDiskFault) {
+			return index, term, err
+		}
 		return 0, 0, s.fail(err)
 	}
 	return index, term, nil
@@ -260,15 +290,18 @@ func (s *Simulator) Propose(id uint64, data []byte) (index, term uint64, err err
 
 func (s *Simulator) Now() int { return s.now }
 
-// Statuses returns independent value snapshots in ascending voter ID order.
+// Statuses returns running nodes' snapshots in ascending voter ID order.
 func (s *Simulator) Statuses() []raftcore.Status {
 	statuses := make([]raftcore.Status, 0, len(s.voters))
 	for _, id := range s.voters {
-		statuses = append(statuses, s.nodes[id].Status())
+		if core := s.nodes[id]; core != nil {
+			statuses = append(statuses, core.Status())
+		}
 	}
 	return statuses
 }
 
+// SavedState returns the running node's last successfully saved/recovered state.
 func (s *Simulator) SavedState(id uint64) (raftcore.HardState, bool) {
 	state, ok := s.stored[id]
 	return state, ok
@@ -303,14 +336,29 @@ func (s *Simulator) finish(core *raftcore.Core, before raftcore.Status) error {
 	if changed {
 		entries = core.Log()
 	}
-	if err := s.checkLogs(nodeView{status: status, entries: entries}, changed); err != nil {
+	// Count a commit only through the matching, locally durable log prefix.
+	// A single voter's new entry may still be unsaved; conversely, losing the
+	// commit-watermark write must not erase a commit whose entries were synced.
+	retained := status
+	stored := s.storedEntries[status.ID]
+	limit := min(status.HardState.Commit, uint64(len(stored)), uint64(len(entries)))
+	retained.HardState.Commit = 0
+	for i := uint64(0); i < limit && sameEntry(entries[i], stored[i]); i++ {
+		retained.HardState.Commit = i + 1
+	}
+	if err := s.checkLogs(nodeView{status: retained, entries: entries}, changed); err != nil {
 		return err
 	}
 	processor := s.processors[core]
 	if processor == nil {
 		var err error
 		processor, err = raftio.New(core,
-			func(batch *raftv1.WALBatch) error { return s.save(status.ID, batch) },
+			func(batch *raftv1.WALBatch) error {
+				if err := s.wals[status.ID].Save(batch); err != nil {
+					return err
+				}
+				return s.save(status.ID, batch)
+			},
 			func(messages []*raftv1.Message) {
 				for _, msg := range messages {
 					s.enqueue(msg)
@@ -326,12 +374,15 @@ func (s *Simulator) finish(core *raftcore.Core, before raftcore.Status) error {
 	// ponytail: inspect a second Ready snapshot to keep the processor independent;
 	// share one batch if profiling shows snapshot copies dominate simulation.
 	if err := processor.Process(); err != nil {
+		if errors.Is(err, ErrDiskFault) {
+			s.log("disk_stop node=%d reason=%v", status.ID, err)
+			if closeErr := s.stop(status.ID); closeErr != nil {
+				return fmt.Errorf("stop node after %v: %w", err, closeErr)
+			}
+		}
 		return err
 	}
-	view := s.observed[status.ID]
-	view.status = core.Status()
-	s.observed[status.ID] = view
-	return nil
+	return s.checkLogs(nodeView{status: core.Status(), entries: entries}, false)
 }
 
 func (s *Simulator) save(id uint64, batch *raftv1.WALBatch) error {

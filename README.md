@@ -50,14 +50,39 @@ terminal: the processor will not retry or advance the batch, and the pending
 `raftio.Restore` builds a fresh follower from recovered storage, replays its
 committed prefix into an empty application, and consumes the initial batch
 without rewriting the WAL. Uncommitted entries remain in the log for later
-replication. Partial application must be discarded before restarting. The
-simulator still retains data in memory; simulated disk faults and node lifecycle
-controls arrive in subset 4. `kvd` still serves only its HTTP skeleton.
+replication. Partial application must be discarded before restarting.
+
+M3 subset 4 runs that same WAL writer and recovery code on a deterministic
+simulated disk. File contents and directory entries have separate working and
+synced images. `Crash(id)` stops a node and drops unsynced data; `Crash(id, n)`
+can retain the first `n` unsynced appended bytes in durably named files to model
+torn writes. Open handles become invalid. `Restart(id)` rebuilds a follower
+from the recovered WAL and replays its committed prefix into a fresh application.
+Previously sent messages remain queued; traffic delivered to a down node is
+dropped. Global leader, committed-entry and application histories survive crashes.
+
+`InjectDiskFault(id, DiskFault{Op: DiskWrite, WriteBytes: 13})` fails the next
+write after accepting 13 bytes. Other operations are `DiskSync`, `DiskDirSync`,
+`DiskCreate`, and `DiskTruncate`; `After` skips matching operations before the
+one-shot failure. An injected I/O error stops only that node, preserving its
+working disk image until explicit power crash or restart. `ClearDiskFault(id)`
+disarms a pending fault. Complete uncertain writes may survive process restart;
+a power crash instead applies the synced/torn-tail model above.
+
+`Running(id)` reports node liveness. `Statuses` and `AppliedEntries` expose only
+running nodes, and `SavedState` reports their last saved/recovered hard state.
+`DiskFiles(id)` returns a sorted list for fault targeting. On a stopped node,
+`CorruptDisk(id, name, offset, mask)` injects a persistent bit flip. CRC failures
+refuse that node's restart while the surviving majority continues. `Heal` only
+repairs network conditions; restarting or repairing disks remains explicit.
+Restart timer seeds are independent of network randomness, and identical seeded
+controls reproduce disk and lifecycle traces. `kvd` remains the HTTP skeleton;
+the broader crash campaigns and M3 acceptance checks belong to subset 5.
 
 Run the focused checks and decoder fuzzing with:
 
 ```bash
-go test -race ./internal/wal ./internal/raftio
+go test -race ./internal/wal ./internal/raftio ./internal/sim
 go test ./internal/wal -run '^$' -fuzz '^FuzzReplay$' -fuzztime=30s
 ```
 
@@ -190,7 +215,8 @@ then call `Advance`. No-op entries advance the applied position without
 executing a command. Retrying `Ready` returns the same batch; consumers must
 track completed application when resuming a partially processed batch. Initial
 entries are emitted for retention, and their committed prefix is replayed for
-application. All retention is currently in memory.
+application. The simulator persists through the WAL on its simulated disk;
+real-file persistence is exercised by integration tests.
 
 M2 acceptance requires repository checks and a passing uncached 10,000-seed
 campaign. Unit tests cover all six Figure 7 log shapes and both Figure 8
@@ -201,8 +227,9 @@ from full-suffix batching; automatic election no-ops remain enabled.
 
 These tests establish log safety and bounded recovery for the tested schedules.
 They do not establish KV linearizability or a universal randomized-election
-recovery deadline. Crash durability, restart simulation, and disk faults belong
-to M3; the KV API and client sessions belong to M4. Bounded batches, pipelining,
+recovery deadline. Focused crash/restart and disk-fault tests now cover M3 subsets
+1–4; the full M3 acceptance campaign remains subset 5. The KV API and client
+sessions belong to M4. Bounded batches, pipelining,
 and proposal backpressure are deferred. Real-process cluster demonstrations
 come later.
 
