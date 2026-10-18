@@ -13,9 +13,9 @@ empty AppendEntries. A deterministic simulator submits commands under network
 faults and checks all five Raft safety invariants.
 
 The `kvd` binary still serves the M0 HTTP skeleton with JSON logs. KV operations,
-durable storage, real peer networking, and metrics are not implemented yet. The
-provisional `Clock`, `Ticker`, and `Transport` interfaces remain available for
-later node integration.
+node persistence integration, real peer networking, and metrics are not
+implemented yet. The provisional `Clock`, `Ticker`, and `Transport` interfaces
+remain available for later node integration.
 
 M3 subset 1 adds the WAL record codec and logical recovery in `internal/wal`.
 Each record holds one protobuf persistence batch with optional hard state and a
@@ -23,8 +23,22 @@ replacement log suffix. A versioned 20-byte header protects both metadata and
 payload with CRC32C. Recovery accepts complete batches atomically, preserves
 committed entries, and reports the last complete byte offset when the newest
 segment ends in an incomplete record. Complete-record checksum failures and
-incomplete older segments are rejected. Filesystem writes, syncs, and physical
-tail truncation arrive in subset 2; the node and simulator still use memory.
+incomplete older segments are rejected.
+
+M3 subset 2 adds the segmented filesystem WAL. `wal.Open(dir)` returns a writer
+and an independent recovered state; `Save(batch)` validates the transition,
+appends one record, and syncs before succeeding. Segments grow on demand toward
+64 MiB, use consecutive names such as `00000000000000000001.wal`, and rotate
+without splitting records. An oversized record occupies its own segment.
+Creating a segment also requires a directory sync. Recovery truncates incomplete
+newest tails, then syncs the newest segment and directory before returning.
+
+The WAL directory must already exist, its creation must be durable, and it must
+be exclusively owned and contain only segments. `Open` does not create or lock
+it. Failed writes or syncs disable further saves until close and recovery; a
+failed save may survive as a complete batch, so its outcome is uncertain.
+`OpenFS` accepts the file-operations boundary for disk fault testing. The node
+and simulator still use memory; integration starts in subset 3.
 
 Run the focused checks and decoder fuzzing with:
 
