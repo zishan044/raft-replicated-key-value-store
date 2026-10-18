@@ -4,7 +4,7 @@ A Go project working toward a replicated, linearizable key-value store with Raft
 consensus implemented from scratch, gRPC, durable storage, and deterministic
 fault testing.
 
-## Current milestone: M2 log replication
+## Current status: M2 complete; M3 in progress
 
 The pure Raft core implements elections, an owned in-memory log, AppendEntries,
 conflict hints, leader proposals, an election no-op, current-term majority
@@ -16,6 +16,22 @@ The `kvd` binary still serves the M0 HTTP skeleton with JSON logs. KV operations
 durable storage, real peer networking, and metrics are not implemented yet. The
 provisional `Clock`, `Ticker`, and `Transport` interfaces remain available for
 later node integration.
+
+M3 subset 1 adds the WAL record codec and logical recovery in `internal/wal`.
+Each record holds one protobuf persistence batch with optional hard state and a
+replacement log suffix. A versioned 20-byte header protects both metadata and
+payload with CRC32C. Recovery accepts complete batches atomically, preserves
+committed entries, and reports the last complete byte offset when the newest
+segment ends in an incomplete record. Complete-record checksum failures and
+incomplete older segments are rejected. Filesystem writes, syncs, and physical
+tail truncation arrive in subset 2; the node and simulator still use memory.
+
+Run the focused checks and decoder fuzzing with:
+
+```bash
+go test -race ./internal/wal
+go test ./internal/wal -run '^$' -fuzz '^FuzzReplay$' -fuzztime=30s
+```
 
 ## Setup
 

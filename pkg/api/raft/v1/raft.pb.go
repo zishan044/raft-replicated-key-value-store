@@ -363,6 +363,124 @@ func (x *Message) GetConflictIndex() uint64 {
 	return 0
 }
 
+// PersistedHardState is the durable term, vote and commit watermark of a node.
+type PersistedHardState struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Term  uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	// Zero means no vote in this term.
+	Vote          uint64 `protobuf:"varint,2,opt,name=vote,proto3" json:"vote,omitempty"`
+	Commit        uint64 `protobuf:"varint,3,opt,name=commit,proto3" json:"commit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PersistedHardState) Reset() {
+	*x = PersistedHardState{}
+	mi := &file_raft_v1_raft_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PersistedHardState) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PersistedHardState) ProtoMessage() {}
+
+func (x *PersistedHardState) ProtoReflect() protoreflect.Message {
+	mi := &file_raft_v1_raft_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PersistedHardState.ProtoReflect.Descriptor instead.
+func (*PersistedHardState) Descriptor() ([]byte, []int) {
+	return file_raft_v1_raft_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *PersistedHardState) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *PersistedHardState) GetVote() uint64 {
+	if x != nil {
+		return x.Vote
+	}
+	return 0
+}
+
+func (x *PersistedHardState) GetCommit() uint64 {
+	if x != nil {
+		return x.Commit
+	}
+	return 0
+}
+
+// WALBatch stores the persistence portion of one Ready as an atomic record.
+// It is an on-disk format, not a peer message.
+type WALBatch struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Absence leaves the previous hard state unchanged.
+	HardState *PersistedHardState `protobuf:"bytes,1,opt,name=hard_state,json=hardState,proto3" json:"hard_state,omitempty"`
+	// Replace the retained suffix from entries[0].index; empty means unchanged.
+	Entries       []*Entry `protobuf:"bytes,2,rep,name=entries,proto3" json:"entries,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WALBatch) Reset() {
+	*x = WALBatch{}
+	mi := &file_raft_v1_raft_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WALBatch) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WALBatch) ProtoMessage() {}
+
+func (x *WALBatch) ProtoReflect() protoreflect.Message {
+	mi := &file_raft_v1_raft_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WALBatch.ProtoReflect.Descriptor instead.
+func (*WALBatch) Descriptor() ([]byte, []int) {
+	return file_raft_v1_raft_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *WALBatch) GetHardState() *PersistedHardState {
+	if x != nil {
+		return x.HardState
+	}
+	return nil
+}
+
+func (x *WALBatch) GetEntries() []*Entry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
 var File_raft_v1_raft_proto protoreflect.FileDescriptor
 
 const file_raft_v1_raft_proto_rawDesc = "" +
@@ -389,7 +507,15 @@ const file_raft_v1_raft_proto_rawDesc = "" +
 	"\vmatch_index\x18\f \x01(\x04R\n" +
 	"matchIndex\x12#\n" +
 	"\rconflict_term\x18\r \x01(\x04R\fconflictTerm\x12%\n" +
-	"\x0econflict_index\x18\x0e \x01(\x04R\rconflictIndex*\x9a\x02\n" +
+	"\x0econflict_index\x18\x0e \x01(\x04R\rconflictIndex\"T\n" +
+	"\x12PersistedHardState\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x12\n" +
+	"\x04vote\x18\x02 \x01(\x04R\x04vote\x12\x16\n" +
+	"\x06commit\x18\x03 \x01(\x04R\x06commit\"p\n" +
+	"\bWALBatch\x12:\n" +
+	"\n" +
+	"hard_state\x18\x01 \x01(\v2\x1b.raft.v1.PersistedHardStateR\thardState\x12(\n" +
+	"\aentries\x18\x02 \x03(\v2\x0e.raft.v1.EntryR\aentries*\x9a\x02\n" +
 	"\vMessageType\x12\x1c\n" +
 	"\x18MESSAGE_TYPE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15MESSAGE_TYPE_PRE_VOTE\x10\x01\x12\"\n" +
@@ -416,22 +542,26 @@ func file_raft_v1_raft_proto_rawDescGZIP() []byte {
 }
 
 var file_raft_v1_raft_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_raft_v1_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_raft_v1_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_raft_v1_raft_proto_goTypes = []any{
-	(MessageType)(0), // 0: raft.v1.MessageType
-	(EntryType)(0),   // 1: raft.v1.EntryType
-	(*Entry)(nil),    // 2: raft.v1.Entry
-	(*Message)(nil),  // 3: raft.v1.Message
+	(MessageType)(0),           // 0: raft.v1.MessageType
+	(EntryType)(0),             // 1: raft.v1.EntryType
+	(*Entry)(nil),              // 2: raft.v1.Entry
+	(*Message)(nil),            // 3: raft.v1.Message
+	(*PersistedHardState)(nil), // 4: raft.v1.PersistedHardState
+	(*WALBatch)(nil),           // 5: raft.v1.WALBatch
 }
 var file_raft_v1_raft_proto_depIdxs = []int32{
 	1, // 0: raft.v1.Entry.type:type_name -> raft.v1.EntryType
 	0, // 1: raft.v1.Message.type:type_name -> raft.v1.MessageType
 	2, // 2: raft.v1.Message.entries:type_name -> raft.v1.Entry
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	4, // 3: raft.v1.WALBatch.hard_state:type_name -> raft.v1.PersistedHardState
+	2, // 4: raft.v1.WALBatch.entries:type_name -> raft.v1.Entry
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_raft_v1_raft_proto_init() }
@@ -445,7 +575,7 @@ func file_raft_v1_raft_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_raft_v1_raft_proto_rawDesc), len(file_raft_v1_raft_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   2,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

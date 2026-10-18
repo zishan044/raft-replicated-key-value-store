@@ -129,7 +129,7 @@ func New(cfg Config) (*Core, error) {
 	if cfg.HardState.Vote != 0 && (cfg.HardState.Term == 0 || !slices.Contains(voters, cfg.HardState.Vote)) {
 		return nil, errors.New("initial vote must name a voter in a positive term")
 	}
-	if err := validateEntries(cfg.Entries, 0, 0, cfg.HardState.Term); err != nil {
+	if err := ValidateEntries(cfg.Entries, 0, 0, cfg.HardState.Term); err != nil {
 		return nil, err
 	}
 	if cfg.HardState.Commit > uint64(len(cfg.Entries)) {
@@ -214,7 +214,7 @@ func (c *Core) Step(msg *raftv1.Message) error {
 			(msg.PrevLogIndex == 0) != (msg.PrevLogTerm == 0) || msg.PrevLogTerm > msg.Term {
 			return errors.New("invalid AppendEntries metadata or response fields")
 		}
-		if err := validateEntries(msg.Entries, msg.PrevLogIndex, msg.PrevLogTerm, msg.Term); err != nil {
+		if err := ValidateEntries(msg.Entries, msg.PrevLogIndex, msg.PrevLogTerm, msg.Term); err != nil {
 			return err
 		}
 	case raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE:
@@ -528,9 +528,10 @@ func (c *Core) lastLogTerm() uint64 {
 	return c.log[len(c.log)-1].Term
 }
 
-// validateEntries is shared by initial logs and incoming append batches. The
-// preceding position anchors both index continuity and nondecreasing terms.
-func validateEntries(entries []*raftv1.Entry, prevIndex, prevTerm, term uint64) error {
+// ValidateEntries checks initial logs, incoming appends and persisted suffixes.
+// The preceding position anchors index continuity and nondecreasing terms;
+// term is the maximum permitted entry term. An empty suffix is valid.
+func ValidateEntries(entries []*raftv1.Entry, prevIndex, prevTerm, term uint64) error {
 	if uint64(len(entries)) > ^uint64(0)-prevIndex {
 		return errors.New("entry indices overflow uint64")
 	}
