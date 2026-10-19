@@ -4,7 +4,7 @@ A Go project working toward a replicated, linearizable key-value store with Raft
 consensus implemented from scratch, gRPC, durable storage, and deterministic
 fault testing.
 
-## Current status: M2 complete; M3 in progress
+## Current status: M3 implemented
 
 The pure Raft core implements elections, an owned in-memory log, AppendEntries,
 conflict hints, leader proposals, an election no-op, current-term majority
@@ -17,7 +17,7 @@ node persistence integration, real peer networking, and metrics are not
 implemented yet. The provisional `Clock`, `Ticker`, and `Transport` interfaces
 remain available for later node integration.
 
-M3 subset 1 adds the WAL record codec and logical recovery in `internal/wal`.
+`internal/wal` provides the WAL record codec and logical recovery.
 Each record holds one protobuf persistence batch with optional hard state and a
 replacement log suffix. A versioned 20-byte header protects both metadata and
 payload with CRC32C. Recovery accepts complete batches atomically, preserves
@@ -25,7 +25,7 @@ committed entries, and reports the last complete byte offset when the newest
 segment ends in an incomplete record. Complete-record checksum failures and
 incomplete older segments are rejected.
 
-M3 subset 2 adds the segmented filesystem WAL. `wal.Open(dir)` returns a writer
+The segmented filesystem WAL's `wal.Open(dir)` returns a writer
 and an independent recovered state; `Save(batch)` validates the transition,
 appends one record, and syncs before succeeding. Segments grow on demand toward
 64 MiB, use consecutive names such as `00000000000000000001.wal`, and rotate
@@ -39,7 +39,7 @@ it. Failed writes or syncs disable further saves until close and recovery; a
 failed save may survive as a complete batch, so its outcome is uncertain.
 `OpenFS` accepts the file-operations boundary for disk fault testing.
 
-M3 subset 3 adds `internal/raftio`, a synchronous processor shared by the
+`internal/raftio` provides a synchronous processor shared by the
 simulator and real-file integration tests. After each core input, it processes
 `Ready` in this order: durably save changed hard state and entries, release
 messages, apply committed entries (including no-op positions), then `Advance`.
@@ -52,7 +52,7 @@ committed prefix into an empty application, and consumes the initial batch
 without rewriting the WAL. Uncommitted entries remain in the log for later
 replication. Partial application must be discarded before restarting.
 
-M3 subset 4 runs that same WAL writer and recovery code on a deterministic
+The simulator runs that same WAL writer and recovery code on a deterministic
 simulated disk. File contents and directory entries have separate working and
 synced images. `Crash(id)` stops a node and drops unsynced data; `Crash(id, n)`
 can retain the first `n` unsynced appended bytes in durably named files to model
@@ -76,8 +76,10 @@ running nodes, and `SavedState` reports their last saved/recovered hard state.
 refuse that node's restart while the surviving majority continues. `Heal` only
 repairs network conditions; restarting or repairing disks remains explicit.
 Restart timer seeds are independent of network randomness, and identical seeded
-controls reproduce disk and lifecycle traces. `kvd` remains the HTTP skeleton;
-the broader crash campaigns and M3 acceptance checks belong to subset 5.
+controls reproduce disk and lifecycle traces. See the
+[WAL durability decision](docs/adr/0003-wal-durability.md) for the format,
+failure policy, guarantees, and scope, and [M3 validation](docs/m3-validation.md)
+for acceptance evidence.
 
 Run the focused checks and decoder fuzzing with:
 
@@ -144,18 +146,22 @@ curl -i http://127.0.0.1:8080/readyz
 | `GET /readyz` | `503`, `not ready` | The node cannot serve KV requests yet. |
 
 Other methods on these endpoints return `405` with `Allow: GET`. Readiness stays
-unavailable throughout M2; it will eventually require a known leader and a
-caught-up state machine.
+unavailable until KV node integration; it will eventually require a known leader
+and a caught-up state machine.
 
 Press Ctrl-C or send SIGTERM to shut down. The server stops accepting connections
 and gives active requests up to five seconds to finish.
 
-## Replication simulator
+## Replication and crash simulators
 
 ```bash
 make sim                    # 10,000 seeds, starting at zero
 make sim SEEDS=500           # smaller uncached campaign
 make sim SEED=123            # one seed with its full event trace
+make sim-crash              # 10,000 crash/recovery seeds
+make sim-crash SEED=123      # replay one crash seed with its trace
+make sim-all SEEDS=500       # 500 seeds in each campaign
+make m3-accept              # 10,000 each, then five minutes of decoder fuzzing
 ```
 
 `SEEDS` must be positive. `SEED` selects one unsigned 64-bit seed, including zero,
@@ -164,6 +170,15 @@ and takes precedence over `SEEDS`. To save a replay, redirect its output:
 command, and the full trace. Reproduction requires the same code and pinned Go
 toolchain. These commands use Go tests with the race detector and disable the
 test-result cache; no additional binary or dependency is required.
+
+The crash campaign rotates through leader, follower, and whole-cluster crashes,
+torn writes, sync failures, corruption, recovery failures, and combined faults.
+It first replicates a baseline, then runs 200 ticks with changing network faults
+and a disk/lifecycle event every 40 ticks. Stopped nodes restart 20 ticks later;
+corrupt bytes are explicitly repaired before that node rejoins. At the end,
+every node loses unsynced data and restarts. The campaign requires preservation
+of observed application prefixes and convergence on a fresh committed marker,
+followed by 40 ticks of stable leadership. Safety histories span all restarts.
 
 Even seeds use three nodes and odd seeds use five. Each successive pair rotates
 through healthy delivery, loss, delay, duplication, reordering, symmetric
@@ -227,8 +242,10 @@ from full-suffix batching; automatic election no-ops remain enabled.
 
 These tests establish log safety and bounded recovery for the tested schedules.
 They do not establish KV linearizability or a universal randomized-election
-recovery deadline. Focused crash/restart and disk-fault tests now cover M3 subsets
-1–4; the full M3 acceptance campaign remains subset 5. The KV API and client
+recovery deadline. Focused M3 tests exhaust byte-write, sync, directory,
+rotation, recovery-truncation, send, application, and advance boundaries. A
+deliberate test mutation releases votes and append acknowledgments before saving;
+the durability checks must reject it. The KV API and client
 sessions belong to M4. Bounded batches, pipelining,
 and proposal backpressure are deferred. Real-process cluster demonstrations
 come later.
@@ -239,17 +256,22 @@ come later.
 | --- | --- |
 | `make build` | Build `bin/kvd`. |
 | `make run` | Start the node with default flags. |
-| `make test` | Run `go test -race ./...`, including 500 simulation seeds. |
-| `make sim` | Run 10,000 simulation seeds without cached results. |
+| `make test` | Run `go test -race ./...`, including 500 seeds in each campaign. |
+| `make sim` | Run 10,000 replication seeds without cached results. |
+| `make sim-crash` | Run 10,000 crash/recovery seeds without cached results. |
+| `make sim-all` | Run 10,000 seeds in each campaign without cached results. |
 | `make sim SEEDS=500` | Run the first 500 simulation seeds without cached results. |
 | `make sim SEED=123` | Replay one seed with its full event trace. |
+| `make sim-crash SEED=123` | Replay one crash seed with its full event trace. |
+| `make fuzz FUZZTIME=5m` | Fuzz the WAL decoder for five minutes. |
+| `make m3-accept` | Run both 10,000-seed campaigns and five-minute fuzzing. |
 | `make fmt` | Format Go and protobuf source. |
 | `make fmt-check` | Check formatting without rewriting files. |
 | `make proto-lint` | Run Buf's standard protobuf lint rules. |
 | `make proto` | Regenerate Go protobuf types. |
 | `make proto-check` | Generate into a temporary directory and compare with `pkg/api`. |
 | `make lint` | Run golangci-lint's default linters. |
-| `make check` | Run formatting, protobuf, lint, race-test, and build checks. |
+| `make check` | Run formatting, protobuf, lint, race tests, build, and 30-second fuzzing. |
 
 Edit `proto/raft/v1/raft.proto`, then run `make proto` and include the generated
 `pkg/api/raft/v1/raft.pb.go` in the same change. Do not edit generated files by
@@ -260,5 +282,6 @@ rewriting the working tree.
 
 GitHub Actions runs `make tools` and `make check` on pushes to `main`, pull
 requests, manual workflow dispatches, and its nightly schedule. These checks
-include 500 replication simulation seeds. Nightly runs also execute `make sim SEEDS=20000`
-without cached results. Local checks alone do not verify hosted CI execution.
+include 500 seeds per campaign and 30 seconds of decoder fuzzing. Nightly runs
+increase fuzzing to five minutes and run each campaign in a separate job with
+20,000 uncached seeds. Local checks alone do not verify hosted CI execution.

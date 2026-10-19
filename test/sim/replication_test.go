@@ -26,6 +26,11 @@ var profiles = []string{
 }
 
 func TestSeededReplication(t *testing.T) {
+	runSeeded(t, runSchedule)
+}
+
+func runSeeded(t *testing.T, schedule func(*testing.T, uint64) *sim.Simulator) {
+	t.Helper()
 	replay := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "seed" {
@@ -44,7 +49,7 @@ func TestSeededReplication(t *testing.T) {
 			seed = *replaySeed
 		}
 		if !t.Run(fmt.Sprintf("seed_%d", seed), func(t *testing.T) {
-			s := runSchedule(t, seed)
+			s := schedule(t, seed)
 			if *trace {
 				t.Logf("\n%s", s.Trace())
 			}
@@ -263,7 +268,11 @@ func check(t *testing.T, s *sim.Simulator, seed uint64, err error) {
 
 func fail(t *testing.T, s *sim.Simulator, seed uint64, reason string) {
 	t.Helper()
-	t.Fatalf("%s\nreplay: make sim SEED=%d\n%s", reason, seed, s.Trace())
+	target := "sim"
+	if strings.HasPrefix(t.Name(), "TestSeededCrashRecovery/") {
+		target = "sim-crash"
+	}
+	t.Fatalf("%s\nreplay: make %s SEED=%d\n%s", reason, target, seed, s.Trace())
 }
 
 func TestConvergenceRequiresAgreement(t *testing.T) {

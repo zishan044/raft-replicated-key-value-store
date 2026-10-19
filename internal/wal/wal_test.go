@@ -16,6 +16,10 @@ import (
 	raftv1 "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1"
 )
 
+// SetSegmentLimitForTest lets external crash tests exercise rotation with small
+// fixtures. It exists only in test builds; production uses 64 MiB segments.
+func SetSegmentLimitForTest(w *WAL, limit int64) { w.segmentLimit = limit }
+
 func openWAL(t *testing.T, dir string) (*WAL, State) {
 	t.Helper()
 	w, state, err := Open(dir)

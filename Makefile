@@ -3,8 +3,9 @@
 BUF_VERSION := 1.74.0
 GOLANGCI_LINT_VERSION := 2.14.0
 SEEDS ?= 10000
+FUZZTIME ?= 30s
 
-.PHONY: build run test sim tools fmt fmt-check lint proto proto-lint proto-check check
+.PHONY: build run test sim sim-crash sim-all fuzz m3-accept tools fmt fmt-check lint proto proto-lint proto-check check
 
 build:
 	go build -o bin/kvd ./cmd/kvd
@@ -15,9 +16,20 @@ run:
 test:
 	go test -race ./...
 
-sim:
-	go test -race -count=1 -timeout=20m ./test/sim -run '^TestSeededReplication$$' $(if $(filter undefined,$(origin SEED)),,-v) \
+sim: SIM_TEST := TestSeededReplication
+sim-crash: SIM_TEST := TestSeededCrashRecovery
+sim-all: SIM_TEST := TestSeeded(Replication|CrashRecovery)
+
+sim sim-crash sim-all:
+	go test -race -count=1 -timeout=45m ./test/sim -run '^$(SIM_TEST)$$' $(if $(filter undefined,$(origin SEED)),,-v) \
 		-args -seeds "$(SEEDS)" $(if $(filter undefined,$(origin SEED)),,-seed "$(SEED)" -trace)
+
+fuzz:
+	go test -timeout=10m ./internal/wal -run '^$$' -fuzz '^FuzzReplay$$' -fuzztime="$(FUZZTIME)" -parallel=2
+
+m3-accept:
+	$(MAKE) sim-all SEEDS=10000
+	$(MAKE) fuzz FUZZTIME=5m
 
 tools:
 	@set -eu; \
@@ -62,4 +74,4 @@ proto-check:
 	bin/buf generate --output "$$generated_tmp"; \
 	diff -ru pkg/api "$$generated_tmp/pkg/api"
 
-check: fmt-check proto-lint proto-check lint test build
+check: fmt-check proto-lint proto-check lint test build fuzz

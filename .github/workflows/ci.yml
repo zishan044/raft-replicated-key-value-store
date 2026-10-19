@@ -17,6 +17,7 @@ jobs:
     timeout-minutes: 30
     env:
       GOTOOLCHAIN: local
+      FUZZTIME: ${{ github.event_name == 'schedule' && '5m' || '30s' }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -24,8 +25,23 @@ jobs:
           go-version-file: go.mod
       - name: Install pinned tools
         run: make tools
-      - name: Check M2 (includes 500 replication simulation seeds)
+      - name: Check M3 (500 seeds per campaign, boundary tests and decoder fuzzing)
         run: make check
-      - name: Nightly simulation campaign
-        if: github.event_name == 'schedule'
-        run: make sim SEEDS=20000
+
+  nightly-simulation:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [sim, sim-crash]
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Run 20,000 uncached seeds
+        run: make ${{ matrix.target }} SEEDS=20000
