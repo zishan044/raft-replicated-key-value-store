@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package raft.v1;
+
+import "raft/v1/raft.proto";
+
+option go_package = "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1;raftv1";
+
+// PeerService transports messages; delivery does not acknowledge persistence.
+// Raft acknowledgements are separate messages emitted after durable storage.
+service PeerService {
+  rpc Deliver(DeliverRequest) returns (DeliverResponse);
+}
+
+message DeliverRequest {
+  Message message = 1;
+}
+
+message DeliverResponse {}

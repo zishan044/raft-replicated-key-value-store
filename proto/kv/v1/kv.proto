@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package kv.v1;
+
+option go_package = "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/kv/v1;kvv1";
+
+service KVService {
+  rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  // Get is replicated through the log until ReadIndex is implemented.
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc CompareAndSwap(CompareAndSwapRequest) returns (CompareAndSwapResponse);
+  // Status reports local observations and is not a linearizable read.
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+// WriteSession permits one unresolved write at a time. Sequence starts at one.
+// Retrying the latest sequence requires the identical operation and arguments.
+message WriteSession {
+  uint64 client_id = 1;
+  uint64 sequence = 2;
+}
+
+message RegisterClientRequest {}
+
+message RegisterClientResponse {
+  // The registration entry's log index. Sessions do not expire in M4.
+  uint64 client_id = 1;
+}
+
+message PutRequest {
+  WriteSession session = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message PutResponse {
+  uint64 revision = 1;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bytes value = 1;
+  // Zero when the key is absent.
+  uint64 revision = 2;
+  bool found = 3;
+}
+
+message DeleteRequest {
+  WriteSession session = 1;
+  string key = 2;
+}
+
+message DeleteResponse {
+  // The deletion's log index, or zero if the key was already absent.
+  uint64 revision = 1;
+}
+
+message CompareAndSwapRequest {
+  WriteSession session = 1;
+  string key = 2;
+  // Zero means create only if the key is absent.
+  uint64 expected_revision = 3;
+  bytes value = 4;
+}
+
+message CompareAndSwapResponse {
+  uint64 revision = 1;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  uint64 node_id = 1;
+  NodeRole role = 2;
+  uint64 term = 3;
+  uint64 leader_id = 4;
+  uint64 commit_index = 5;
+  uint64 applied_index = 6;
+  uint64 last_log_index = 7;
+}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_FOLLOWER = 1;
+  NODE_ROLE_CANDIDATE = 2;
+  NODE_ROLE_LEADER = 3;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_NOT_LEADER = 1;
+  ERROR_CODE_BUSY = 2;
+  // A write may have applied. Retry the identical session and sequence.
+  ERROR_CODE_UNKNOWN = 3;
+  ERROR_CODE_CAS_CONFLICT = 4;
+  ERROR_CODE_INVALID_SESSION = 5;
+  ERROR_CODE_INVALID_SEQUENCE = 6;
+}
+
+// ErrorDetail accompanies a gRPC status. Application-level failures also occur
+// in CommandResult so their exact results can be cached and replayed.
+message ErrorDetail {
+  ErrorCode code = 1;
+  // NotLeader hint; zero/empty when the leader is unknown.
+  uint64 leader_id = 2;
+  string leader_address = 3;
+  // CASConflict: zero when the key is absent.
+  uint64 current_revision = 4;
+  // InvalidSequence: the next sequence, or zero when exhausted.
+  uint64 expected_sequence = 5;
+}
+
+// Command is the application payload of a normal Raft entry, not an RPC.
+// The Raft entry and WAL envelopes remain unchanged.
+message Command {
+  oneof operation {
+    RegisterClientRequest register_client = 1;
+    PutRequest put = 2;
+    GetRequest get = 3;
+    DeleteRequest delete = 4;
+    CompareAndSwapRequest compare_and_swap = 5;
+  }
+}
+
+// CommandResult is captured at application time. Only writes cache results.
+// A retried write returns its original revision, not the retry entry's index.
+message CommandResult {
+  uint64 client_id = 1;
+  bytes value = 2;
+  uint64 revision = 3;
+  bool found = 4;
+  ErrorDetail error = 5;
+}

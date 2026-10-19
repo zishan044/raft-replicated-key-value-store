@@ -4,3 +4,7 @@ plugins:
   - local: [go, run, google.golang.org/protobuf/cmd/protoc-gen-go]
     out: pkg/api
     opt: paths=source_relative
+  # The gRPC generator is pinned as a Go tool in go.mod.
+  - local: [go, tool, protoc-gen-go-grpc]
+    out: pkg/api
+    opt: paths=source_relative
