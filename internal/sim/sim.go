@@ -253,7 +253,8 @@ func (s *Simulator) Run(ticks int) error {
 }
 
 // Propose delivers an opaque command to one node and processes its Ready batch.
-// ErrNotLeader is a normal rejection. Acceptance returns a local log position;
+// ErrNotLeader, ErrBusy and ErrCommandTooLarge are normal rejections.
+// Acceptance returns a local log position;
 // inspect AppliedEntries to establish application. A disk fault returns the
 // accepted index/term with ErrDiskFault: its persistence outcome is uncertain.
 // Other core failures are terminal.
@@ -273,7 +274,7 @@ func (s *Simulator) Propose(id uint64, data []byte) (index, term uint64, err err
 	index, term, err = core.Propose(data)
 	if err != nil {
 		s.log("proposal_rejected node=%d reason=%v", id, err)
-		if errors.Is(err, raftcore.ErrNotLeader) {
+		if errors.Is(err, raftcore.ErrNotLeader) || errors.Is(err, raftcore.ErrBusy) || errors.Is(err, raftcore.ErrCommandTooLarge) {
 			return 0, 0, err
 		}
 		return 0, 0, s.fail(err)

@@ -10,6 +10,7 @@ import (
 	"slices"
 
 	raftv1 "github.com/zishan044/raft-replicated-key-value-store.git/pkg/api/raft/v1"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -21,11 +22,20 @@ const (
 	Leader    Role = "leader"
 )
 
+const (
+	MaxCommandBytes     = 512 << 10
+	MaxAppendEntries    = 512
+	MaxPeerMessageBytes = 1 << 20  // encoded DeliverRequest, including its wrapper
+	MaxUncommittedBytes = 64 << 20 // encoded entries; admission limit for proposals
+)
+
 var (
 	ErrReadyPending       = errors.New("advance the outstanding Ready before supplying input")
 	ErrNoReady            = errors.New("no outstanding Ready to advance")
 	ErrUnsupportedMessage = errors.New("message type is not implemented")
 	ErrNotLeader          = errors.New("not leader")
+	ErrCommandTooLarge    = errors.New("command exceeds size limit")
+	ErrBusy               = errors.New("uncommitted log is full")
 )
 
 type progress struct {
@@ -86,19 +96,20 @@ type Status struct {
 
 // Core must be owned by one goroutine. It is not safe for concurrent use.
 type Core struct {
-	id             uint64
-	voters         []uint64
-	electionTicks  int
-	heartbeatTicks int
-	rng            *rand.Rand
-	role           Role
-	leaderID       uint64
-	hardState      HardState
-	log            []*raftv1.Entry // index i is stored at log[i-1]; no compaction yet
-	unstableFrom   uint64          // first index needing retention; last index + 1 if none
-	appliedIndex   uint64
-	votes          map[uint64]bool
-	progress       map[uint64]*progress // remote voters only; reset on leadership change
+	id               uint64
+	voters           []uint64
+	electionTicks    int
+	heartbeatTicks   int
+	rng              *rand.Rand
+	role             Role
+	leaderID         uint64
+	hardState        HardState
+	log              []*raftv1.Entry // index i is stored at log[i-1]; no compaction yet
+	uncommittedBytes uint64          // encoded entries after hardState.Commit
+	unstableFrom     uint64          // first index needing retention; last index + 1 if none
+	appliedIndex     uint64
+	votes            map[uint64]bool
+	progress         map[uint64]*progress // remote voters only; reset on leadership change
 
 	electionElapsed  int
 	electionTimeout  int
@@ -132,11 +143,14 @@ func New(cfg Config) (*Core, error) {
 	if err := ValidateEntries(cfg.Entries, 0, 0, cfg.HardState.Term); err != nil {
 		return nil, err
 	}
+	if err := validateEntrySizes(cfg.Entries); err != nil {
+		return nil, err
+	}
 	if cfg.HardState.Commit > uint64(len(cfg.Entries)) {
 		return nil, errors.New("initial commit index exceeds the last log index")
 	}
 	rng := rand.New(rand.NewPCG(cfg.Seed, 0))
-	return &Core{
+	core := &Core{
 		id:              cfg.ID,
 		voters:          voters,
 		electionTicks:   cfg.ElectionTicks,
@@ -147,7 +161,11 @@ func New(cfg Config) (*Core, error) {
 		log:             cloneEntries(cfg.Entries),
 		unstableFrom:    1,
 		electionTimeout: cfg.ElectionTicks + rng.IntN(cfg.ElectionTicks),
-	}, nil
+	}
+	for _, entry := range core.log[cfg.HardState.Commit:] {
+		core.uncommittedBytes += uint64(proto.Size(entry))
+	}
+	return core, nil
 }
 
 // Tick campaigns when a non-leader times out, or emits periodic leader heartbeats.
@@ -209,12 +227,18 @@ func (c *Core) Step(msg *raftv1.Message) error {
 		}
 	case raftv1.MessageType_MESSAGE_TYPE_REQUEST_VOTE_RESPONSE:
 	case raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES:
+		if len(msg.Entries) > MaxAppendEntries || proto.Size(&raftv1.DeliverRequest{Message: msg}) > MaxPeerMessageBytes {
+			return errors.New("AppendEntries exceeds batch limit")
+		}
 		if msg.Reject || msg.LastLogIndex != 0 || msg.LastLogTerm != 0 || msg.MatchIndex != 0 ||
 			msg.ConflictTerm != 0 || msg.ConflictIndex != 0 ||
 			(msg.PrevLogIndex == 0) != (msg.PrevLogTerm == 0) || msg.PrevLogTerm > msg.Term {
 			return errors.New("invalid AppendEntries metadata or response fields")
 		}
 		if err := ValidateEntries(msg.Entries, msg.PrevLogIndex, msg.PrevLogTerm, msg.Term); err != nil {
+			return err
+		}
+		if err := validateEntrySizes(msg.Entries); err != nil {
 			return err
 		}
 	case raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE:
@@ -279,12 +303,23 @@ func (c *Core) Step(msg *raftv1.Message) error {
 // Propose appends an owned copy of data on the leader and returns its position.
 // Success means local acceptance, not commitment; observe Ready for commitment.
 // On ErrNotLeader, Status supplies the most recently known LeaderID.
+// ErrCommandTooLarge and ErrBusy reject before append, with no state changes.
 func (c *Core) Propose(data []byte) (index, term uint64, err error) {
 	if !c.initialized || c.readyPending {
 		return 0, 0, ErrReadyPending
 	}
 	if c.role != Leader {
 		return 0, 0, ErrNotLeader
+	}
+	if len(data) > MaxCommandBytes {
+		return 0, 0, ErrCommandTooLarge
+	}
+	entryBytes := uint64(proto.Size(&raftv1.Entry{
+		Index: c.lastLogIndex() + 1, Term: c.hardState.Term,
+		Type: raftv1.EntryType_ENTRY_TYPE_NORMAL, Data: data,
+	}))
+	if c.uncommittedBytes > MaxUncommittedBytes || entryBytes > MaxUncommittedBytes-c.uncommittedBytes {
+		return 0, 0, ErrBusy
 	}
 	index = c.appendEntry(raftv1.EntryType_ENTRY_TYPE_NORMAL, data)
 	c.maybeCommit()
@@ -332,10 +367,16 @@ func (c *Core) stepAppend(msg *raftv1.Message) error {
 	if !response.Reject {
 		if appendFrom < len(msg.Entries) {
 			first := msg.Entries[appendFrom].Index
+			for _, entry := range c.log[first-1:] {
+				c.uncommittedBytes -= uint64(proto.Size(entry))
+			}
 			c.log = append(c.log[:first-1], cloneEntries(msg.Entries[appendFrom:])...)
+			for _, entry := range msg.Entries[appendFrom:] {
+				c.uncommittedBytes += uint64(proto.Size(entry))
+			}
 			c.unstableFrom = min(c.unstableFrom, first)
 		}
-		c.hardState.Commit = max(c.hardState.Commit, min(msg.LeaderCommit, response.MatchIndex))
+		c.commitTo(max(c.hardState.Commit, min(msg.LeaderCommit, response.MatchIndex)))
 	}
 	c.messages = append(c.messages, response)
 	return nil
@@ -386,7 +427,11 @@ func (c *Core) maybeBecomeLeader() {
 
 func (c *Core) appendEntry(kind raftv1.EntryType, data []byte) uint64 {
 	index := c.lastLogIndex() + 1
-	c.log = append(c.log, &raftv1.Entry{Index: index, Term: c.hardState.Term, Type: kind, Data: slices.Clone(data)})
+	entry := &raftv1.Entry{Index: index, Term: c.hardState.Term, Type: kind, Data: slices.Clone(data)}
+	c.log = append(c.log, entry)
+	// Election no-ops bypass proposal admission so a new leader can commit an
+	// inherited full log. Followers likewise retain whatever their leader sends.
+	c.uncommittedBytes += uint64(proto.Size(entry))
 	return index
 }
 
@@ -399,20 +444,27 @@ func (c *Core) broadcastAppend() {
 }
 
 func (c *Core) sendAppend(peer uint64) {
-	// ponytail: full-suffix retries duplicate bytes; add bounded batches and
-	// pipelining if measured replication throughput needs them.
 	previous := c.progress[peer].next - 1
 	var previousTerm uint64
 	if previous > 0 {
 		previousTerm = c.log[previous-1].Term
 	}
-	c.messages = append(c.messages, &raftv1.Message{
+	msg := &raftv1.Message{
 		Type: raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES,
 		From: c.id, To: peer, Term: c.hardState.Term,
 		PrevLogIndex: previous, PrevLogTerm: previousTerm, LeaderCommit: c.hardState.Commit,
-		// Own the slice before future suffix replacement; log entry objects are immutable.
-		Entries: slices.Clone(c.log[previous:]),
-	})
+	}
+	messageBytes := proto.Size(msg)
+	for _, entry := range c.log[previous:min(c.lastLogIndex(), previous+MaxAppendEntries)] {
+		// Each repeated entry adds its field tag and length-delimited payload.
+		nextBytes := messageBytes + protowire.SizeTag(10) + protowire.SizeBytes(proto.Size(entry))
+		if protowire.SizeTag(1)+protowire.SizeBytes(nextBytes) > MaxPeerMessageBytes {
+			break
+		}
+		msg.Entries = append(msg.Entries, entry) // own slice; entry objects are immutable
+		messageBytes = nextBytes
+	}
+	c.messages = append(c.messages, msg)
 }
 
 func (c *Core) stepAppendResponse(msg *raftv1.Message) {
@@ -461,10 +513,38 @@ func (c *Core) maybeCommit() bool {
 	// The largest index held by a strict majority, including even-sized groups.
 	index := matched[(len(matched)-1)/2]
 	if index > c.hardState.Commit && c.log[index-1].Term == c.hardState.Term {
-		c.hardState.Commit = index
+		c.commitTo(index)
 		return true
 	}
 	return false
+}
+
+func (c *Core) commitTo(index uint64) {
+	for _, entry := range c.log[c.hardState.Commit:index] {
+		c.uncommittedBytes -= uint64(proto.Size(entry))
+	}
+	c.hardState.Commit = index
+}
+
+// Check both the command cap and that a retained entry can always fit alone,
+// including unknown protobuf fields and worst-case future leader metadata.
+// WAL format validation remains independent of these operational limits.
+func validateEntrySizes(entries []*raftv1.Entry) error {
+	for _, entry := range entries {
+		if len(entry.Data) > MaxCommandBytes {
+			return ErrCommandTooLarge
+		}
+		msg := &raftv1.Message{
+			Type: raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES,
+			From: ^uint64(0), To: ^uint64(0), Term: ^uint64(0),
+			PrevLogIndex: ^uint64(0), PrevLogTerm: ^uint64(0), LeaderCommit: ^uint64(0),
+			Entries: []*raftv1.Entry{entry},
+		}
+		if proto.Size(&raftv1.DeliverRequest{Message: msg}) > MaxPeerMessageBytes {
+			return ErrCommandTooLarge
+		}
+	}
+	return nil
 }
 
 // Ready emits state changes, changed log suffixes, messages and committed entries.

@@ -578,3 +578,16 @@ func TestProposalApplicationOwnershipAndReplay(t *testing.T) {
 		t.Fatal("identical seeded proposal schedules did not replay byte for byte")
 	}
 }
+
+func TestOversizedProposalDoesNotStopSimulation(t *testing.T) {
+	s := newSim(t, 42)
+	run(t, s, 80)
+	leader := liveLeader(t, s)
+	before := s.Statuses()
+	index, term, err := s.Propose(leader.ID, make([]byte, raftcore.MaxCommandBytes+1))
+	if index != 0 || term != 0 || !errors.Is(err, raftcore.ErrCommandTooLarge) || !slices.Equal(before, s.Statuses()) {
+		t.Fatalf("oversized proposal mutated the cluster: index=%d term=%d err=%v", index, term, err)
+	}
+	index, term = proposeMarker(t, s, "after rejection")
+	assertMarker(t, s, index, term, "after rejection")
+}
