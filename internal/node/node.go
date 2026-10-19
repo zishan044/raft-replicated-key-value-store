@@ -131,7 +131,8 @@ func (n *Node) Submit(ctx context.Context, cmd *kvv1.Command) (*kvv1.CommandResu
 }
 
 // Step copies the peer message. A malformed input returns an error without
-// stopping the node. Persistence or application failure is terminal.
+// stopping the node. Persistence or application failure is terminal and also
+// matches ErrStopped, so peer handlers can distinguish unavailable nodes.
 func (n *Node) Step(ctx context.Context, msg *raftv1.Message) error {
 	if msg == nil {
 		return errors.New("peer message is required")
@@ -295,7 +296,7 @@ func start(core *raftcore.Core, machine *kv.Machine, save func(*raftv1.WALBatch)
 				if err := p.Process(); err != nil {
 					n.err = err
 					if req.kind != propose {
-						req.reply <- response{err: err}
+						req.reply <- response{err: errors.Join(ErrStopped, err)}
 					}
 					return
 				}

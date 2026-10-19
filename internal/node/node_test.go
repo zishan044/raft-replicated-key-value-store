@@ -376,7 +376,7 @@ func TestUncertainSaveWithholdsSuccessAndRecovers(t *testing.T) {
 		Type: raftv1.MessageType_MESSAGE_TYPE_APPEND_ENTRIES_RESPONSE, From: 2, To: 1, Term: msg.Term,
 		PrevLogIndex: msg.PrevLogIndex, MatchIndex: 2,
 	})
-	if !errors.Is(err, failure) {
+	if !errors.Is(err, failure) || !errors.Is(err, ErrStopped) {
 		t.Fatalf("save failure = %v", err)
 	}
 	if r := receive(t, done); !errors.Is(r.err, ErrUnknown) || !errors.Is(r.err, failure) || r.result != nil {
