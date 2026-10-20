@@ -9,6 +9,7 @@ FUZZTIME ?= 30s
 
 build:
 	go build -o bin/kvd ./cmd/kvd
+	go build -o bin/kvctl ./cmd/kvctl
 
 run:
 	go run ./cmd/kvd
