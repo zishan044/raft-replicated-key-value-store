@@ -25,7 +25,7 @@ jobs:
           go-version-file: go.mod
       - name: Install pinned tools
         run: make tools
-      - name: Check M3 (500 seeds per campaign, boundary tests and decoder fuzzing)
+      - name: Check M4 (three-process integration, race tests, protobuf and fuzzing)
         run: make check
 
   nightly-simulation:

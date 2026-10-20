@@ -5,7 +5,7 @@ GOLANGCI_LINT_VERSION := 2.14.0
 SEEDS ?= 10000
 FUZZTIME ?= 30s
 
-.PHONY: build run test sim sim-crash sim-all fuzz m3-accept tools fmt fmt-check lint proto proto-lint proto-check check
+.PHONY: build run test integration sim sim-crash sim-all fuzz m3-accept m4-accept tools fmt fmt-check lint proto proto-lint proto-check check
 
 build:
 	go build -o bin/kvd ./cmd/kvd
@@ -16,6 +16,9 @@ run:
 
 test:
 	go test -race ./...
+
+integration:
+	go test -tags=integration -race -count=1 -timeout=3m -v ./test/integration
 
 sim: SIM_TEST := TestSeededReplication
 sim-crash: SIM_TEST := TestSeededCrashRecovery
@@ -31,6 +34,10 @@ fuzz:
 m3-accept:
 	$(MAKE) sim-all SEEDS=10000
 	$(MAKE) fuzz FUZZTIME=5m
+
+m4-accept:
+	$(MAKE) check
+	$(MAKE) sim-all SEEDS=10000
 
 tools:
 	@set -eu; \
@@ -61,7 +68,7 @@ fmt-check:
 	bin/buf format --diff --exit-code
 
 lint:
-	bin/golangci-lint run --no-config ./...
+	bin/golangci-lint run --no-config --build-tags=integration ./...
 
 proto:
 	bin/buf generate
@@ -75,4 +82,4 @@ proto-check:
 	bin/buf generate --output "$$generated_tmp"; \
 	diff -ru pkg/api "$$generated_tmp/pkg/api"
 
-check: fmt-check proto-lint proto-check lint test build fuzz
+check: fmt-check proto-lint proto-check lint test build integration fuzz
